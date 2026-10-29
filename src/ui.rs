@@ -11,7 +11,23 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::{App, HAS_RANGE_INPUT, OPS, OPS_DESC, Panel, ROTATE_INPUT, TEXT_INPUT};
+use crate::tui::{App, Mode, OPS, OPS_DESC, Panel, ROTATE_INPUT};
+
+/// Per-operation accent colors, indexed by position in `OPS`.
+fn op_color(i: usize) -> Color {
+    match i {
+        0 | 1 => Color::Rgb(255, 159, 67), // merge / split — orange
+        2 => Color::Rgb(86, 212, 145), // compress — green
+        3 => Color::Rgb(199, 126, 255), // rotate — purple
+        4 => Color::Rgb(248, 81, 93), // delete — red
+        5 => Color::Rgb(79, 174, 255), // info — blue
+        6 => Color::Rgb(245, 213, 71), // watermark — yellow
+        7 => Color::Rgb(64, 196, 230), // page numbers — cyan
+        8 => Color::Rgb(228, 108, 242), // metadata — magenta
+        9 | 10 => Color::Rgb(108, 192, 151), // extract — teal
+        _ => Color::White,
+    }
+}
 
 /// Palette. Tweak here and the whole dashboard re-skins.
 const ACCENT: Color = Color::Cyan;
@@ -40,7 +56,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
 
-    render_title(f, outer[0]);
+    render_title(f, app, outer[0]);
 
     let main = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(outer[1]);
     render_queue(f, main[0], app);
@@ -48,30 +64,49 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, outer[2], app);
 }
 
-fn render_title(f: &mut Frame, area: ratatui::layout::Rect) {
-    let hint = "  [a] add · [←][→] focus · [↑][↓] move · [enter] run · [q] quit  ";
+fn render_title(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let hint = "  [a] add sample · [f] add file · [←][→] focus · [↑][↓] move · [enter] run · [q] quit  ";
     let width = area.width.saturating_sub(hint.len() as u16);
-    let line = Line::from(vec![
-        Span::styled(" LocalPDF-TUI ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" · private pdf toolkit ", Style::default().fg(DIM)),
-        Span::raw("·".repeat(width.max(1) as usize)),
-        Span::styled(hint, Style::default().fg(DIM)),
-    ]);
+    let mut spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("LocalPDF-TUI ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("v0.4", Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+    ];
+    if app.mode == Mode::AddFile {
+        spans.push(Span::styled(
+            " · typing path…",
+            Style::default().fg(op_color(6)).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    spans.push(Span::styled(
+        " · private pdf toolkit ",
+        Style::default().fg(DIM),
+    ));
+    spans.push(Span::raw("·".repeat(width.max(1) as usize)));
+    spans.push(Span::styled(hint, Style::default().fg(DIM)));
+    let line = Line::from(spans);
     let widget = Paragraph::new(line).style(Style::default().bg(PANEL_BG));
     f.render_widget(widget, area);
 }
 
-fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let block = bordered_block(" FILE QUEUE ");
     if app.queue.is_empty() {
         let empty = Paragraph::new(vec![
             Line::from(Span::styled("  empty", Style::default().fg(DIM))),
-            Line::from(Span::styled("  press [a] to queue a sample document", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "  [a] queue a sample document · [f] add your own file",
+                Style::default().fg(DIM),
+            )),
         ])
         .block(block);
         f.render_widget(empty, area);
         return;
     }
+
+    let total_kb: u64 = app.queue.iter().map(|e| e.size_kb).sum();
+    // List fills the panel; a one-line footer reports the queue totals.
+    let split = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
 
     let mut state = ListState::default();
     state.select(Some(app.q_index));
@@ -79,7 +114,18 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .block(block)
         .highlight_symbol("▸ ")
         .highlight_style(Style::default().bg(SEL_BG).fg(Color::White).add_modifier(Modifier::BOLD));
-    f.render_widget(list, area);
+    f.render_widget(list, split[0]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("  Σ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{} file{} · {} KB", app.queue.len(), if app.queue.len() == 1 { "" } else { "s" }, total_kb),
+            Style::default().fg(DIM),
+        ),
+        Span::styled("   [a] sample · [f] add file", Style::default().fg(DIM)),
+    ]))
+    .style(Style::default().bg(PANEL_BG));
+    f.render_widget(footer, split[1]);
 }
 
 fn render_ops(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
@@ -89,18 +135,23 @@ fn render_ops(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             .split(area);
 
     let ops_block = bordered_block(" OPERATIONS ");
-    let active = app.focus == Panel::Ops;
+    let active = app.focus == Panel::Ops && app.mode == Mode::Normal;
     let lines: Vec<Line> = (0..OPS.len())
         .map(|i| {
             let marker = if active && i == app.ops_index { "▸" } else { " " };
+            let selected = active && i == app.ops_index;
             let op_style = Style::default()
-                .fg(Color::White)
-                .add_modifier(if active && i == app.ops_index {
+                .fg(if selected { Color::White } else { op_color(i) })
+                .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 });
-            let desc_style = Style::default().fg(Color::Rgb(139, 148, 158));
+            let desc_style = Style::default().fg(if selected {
+                Color::Rgb(229, 231, 235)
+            } else {
+                Color::Rgb(139, 148, 158)
+            });
             Line::from(vec![
                 Span::styled(format!("{marker}  {}", OPS[i]), op_style),
                 Span::raw("  "),
@@ -118,38 +169,50 @@ fn render_ops(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     f.render_widget(list, split[0]);
 
     // Context input line: label + editable value, active only for ops that
-    // take input (ranges / rotate / free-text / metadata).
+    // take input (ranges / rotate / free-text / metadata). In add-file mode
+    // the same line becomes the file-path prompt.
     let op = app.ops_index;
-    let takes_input =
-        HAS_RANGE_INPUT.contains(&op) || op == ROTATE_INPUT || TEXT_INPUT.contains(&op);
-    let spec_selected = active && takes_input;
-    let label = match op {
-        1 => "SPLIT RANGES    ",
-        ROTATE_INPUT => "ROTATE RANGES:DEG",
-        4 => "DELETE PAGES    ",
-        6 => "WATERMARK TEXT  ",
-        8 => "METADATA K=V    ",
-        9 => "EXTRACT PAGES   ",
-        _ => " CONTEXT        ",
+    let label = if app.mode == Mode::AddFile {
+        "ADD FILE PATH    "
+    } else {
+        match op {
+            1 => "SPLIT RANGES    ",
+            ROTATE_INPUT => "ROTATE RANGES:DEG",
+            4 => "DELETE PAGES    ",
+            6 => "WATERMARK TEXT  ",
+            8 => "METADATA K=V    ",
+            9 => "EXTRACT PAGES   ",
+            _ => " CONTEXT        ",
+        }
     };
-    let value = match op {
-        1 | 4 | 9 => format!("[ {}▏ ]", app.ctx_input),
-        ROTATE_INPUT | 6 | 8 => format!("[ {}▏ ]", app.ctx_input),
-        _ => "[        ]".to_string(),
+    let value = if app.mode == Mode::AddFile {
+        format!("[ {}▏ ]", app.file_input)
+    } else {
+        match op {
+            1 | 4 | 9 => format!("[ {}▏ ]", app.ctx_input),
+            ROTATE_INPUT | 6 | 8 => format!("[ {}▏ ]", app.ctx_input),
+            _ => "[        ]".to_string(),
+        }
     };
-    let help = match op {
-        1 => "   1-based, e.g. 1-3,5 — applied to the highlighted file",
-        ROTATE_INPUT => "   e.g. 1,3:90 — pages and angle for the highlighted file",
-        4 => "   1-based, e.g. 2,4-5 — removes pages from the highlighted file",
-        6 => "   stamped diagonally on every page of the highlighted file",
-        8 => "   e.g. Title=Q3 Report — one Info key per run",
-        9 => "   ranges optional — blank extracts every page",
-        _ => "   no input — [enter] runs on the highlighted file",
+    let help = if app.mode == Mode::AddFile {
+        "   workspace-relative or absolute — [enter] add · [esc] cancel"
+    } else {
+        match op {
+            1 => "   1-based, e.g. 1-3,5 — applied to the highlighted file",
+            ROTATE_INPUT => "   e.g. 1,3:90 — pages and angle for the highlighted file",
+            4 => "   1-based, e.g. 2,4-5 — removes pages from the highlighted file",
+            6 => "   stamped diagonally on every page of the highlighted file",
+            8 => "   e.g. Title=Q3 Report — one Info key per run",
+            9 => "   ranges optional — blank extracts every page",
+            _ => "   no input — [enter] runs on the highlighted file",
+        }
     };
+    let input_mode_active = app.mode == Mode::AddFile;
     let label_style = Style::default()
-        .fg(if spec_selected { ACCENT } else { DIM })
+        .fg(if input_mode_active { op_color(6) } else { ACCENT })
         .add_modifier(Modifier::BOLD);
-    let value_style = Style::default().fg(if spec_selected { Color::White } else { DIM });
+    let value_style =
+        Style::default().fg(if input_mode_active { Color::White } else { DIM });
     let input = Paragraph::new(Line::from(vec![
         Span::styled(label, label_style),
         Span::styled(value, value_style),

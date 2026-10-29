@@ -77,6 +77,53 @@ pub struct ExtractImagesReport {
     pub output_dir: String,
 }
 
+/// Report for `--encrypt` / `--decrypt`.
+#[derive(Debug, Serialize)]
+pub struct EncryptionReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub source_file: String,
+    pub output_file: String,
+    pub pages: u32,
+    pub encrypted: bool,
+    pub algorithm: &'static str,
+}
+
+/// Report for `--repair`: a clean re-save of a damaged document.
+#[derive(Debug, Serialize)]
+pub struct RepairReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub source_file: String,
+    pub output_file: String,
+    pub pages: u32,
+    pub recovered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_kind: Option<&'static str>,
+}
+
+/// Per-file outcome of `--batch`.
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    pub file: String,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Report for `--batch`: every PDF in a directory run through one op.
+#[derive(Debug, Serialize)]
+pub struct BatchReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub input_dir: String,
+    pub output_dir: String,
+    pub processed: u32,
+    pub results: Vec<BatchResult>,
+}
+
 /// Inclusive 1-based page range: `start..=end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -1045,6 +1092,197 @@ impl Engine {
         })
     }
 
+    // ---- M3: encryption, repair, batch ---------------------------------
+
+    /// Encrypt the document with AES-128 (revision-4 crypt filter). The
+    /// owner password controls permissions; the user password opens the
+    /// document.
+    pub fn encrypt(
+        &self,
+        input: &Path,
+        user_password: &str,
+        owner_password: &str,
+        output: &Path,
+    ) -> AppResult<EncryptionReport> {
+        let resolved = self.resolve(input)?;
+        let mut doc = self.load_pdf(&resolved)?;
+        if doc.is_encrypted() {
+            return Err(AppError::Operation("document is already encrypted".into()));
+        }
+        // Revision 3/4 key derivation hashes the trailer /ID array, which
+        // must exist — generate one when the source document lacks it.
+        if doc
+            .trailer
+            .get(b"ID")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .is_none()
+        {
+            let id = Object::string_literal(make_file_id(&resolved));
+            doc.trailer
+                .set("ID", Object::Array(vec![id.clone(), id]));
+        }
+        let filter: std::sync::Arc<dyn lopdf::encryption::crypt_filters::CryptFilter> =
+            std::sync::Arc::new(lopdf::encryption::crypt_filters::Aes128CryptFilter);
+        let version = lopdf::EncryptionVersion::V4 {
+            document: &doc,
+            encrypt_metadata: true,
+            crypt_filters: std::collections::BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+            stream_filter: b"StdCF".to_vec(),
+            string_filter: b"StdCF".to_vec(),
+            owner_password,
+            user_password,
+            permissions: lopdf::Permissions::all(),
+        };
+        let state = lopdf::EncryptionState::try_from(version)
+            .map_err(|e| AppError::Operation(format!("encryption setup failed: {e}")))?;
+        doc.encrypt(&state)
+            .map_err(|e| AppError::Operation(format!("encrypt: {e}")))?;
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(EncryptionReport {
+            status: "success",
+            operation: "encrypt",
+            source_file: display_path(&resolved),
+            output_file: display_path(&written),
+            pages: doc.get_pages().len() as u32,
+            encrypted: true,
+            algorithm: "AES-128",
+        })
+    }
+
+    /// Decrypt an encrypted document back to a plain one. The file keeps
+    /// every object; only the encryption layer is stripped.
+    pub fn decrypt(
+        &self,
+        input: &Path,
+        password: &str,
+        output: &Path,
+    ) -> AppResult<EncryptionReport> {
+        let resolved = self.resolve(input)?;
+        // Loading WITH the password materializes the object map and decrypts
+        // it in place. A plain load of an encrypted file leaves a sparse
+        // still-encrypted map, and saving that would corrupt the document.
+        let mut doc = Document::load_with_password(&resolved, password)
+            .map_err(|e| AppError::Operation(format!("decryption failed (wrong password?): {e}")))?;
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(EncryptionReport {
+            status: "success",
+            operation: "decrypt",
+            source_file: display_path(&resolved),
+            output_file: display_path(&written),
+            pages: doc.get_pages().len() as u32,
+            encrypted: false,
+            algorithm: "none",
+        })
+    }
+
+    /// Load a possibly-damaged document leniently (lopdf reconstructs broken
+    /// cross-reference tables on load) and write a clean, re-saved copy.
+    pub fn repair(&self, input: &Path, output: &Path) -> AppResult<RepairReport> {
+        let resolved = self.resolve(input)?;
+        let mut doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+        let pages = doc.get_pages().len() as u32;
+        let written = self.save_pdf(&mut doc, output)?;
+        let recovery_kind = match doc.xref_recovery {
+            Some(lopdf::xref::XrefRecovery::OffsetCorrected) => Some("offset-corrected"),
+            Some(lopdf::xref::XrefRecovery::Reconstructed) => Some("reconstructed"),
+            _ => None,
+        };
+        Ok(RepairReport {
+            status: "success",
+            operation: "repair",
+            source_file: display_path(&resolved),
+            output_file: display_path(&written),
+            pages,
+            recovered: recovery_kind.is_some(),
+            recovery_kind,
+        })
+    }
+
+    /// Run one operation (`compress` | `repair` | `pagenum`) over every
+    /// `*.pdf` in `input_dir`, writing results into `out_dir`. File order
+    /// is sorted by name so the JSON report is deterministic.
+    pub fn batch(&self, input_dir: &Path, op_name: &str, out_dir: &Path) -> AppResult<BatchReport> {
+        match op_name {
+            "compress" | "repair" | "pagenum" => {}
+            other => {
+                return Err(AppError::Operation(format!(
+                    "batch op '{other}' is not supported (use compress, repair, or pagenum)"
+                )));
+            }
+        }
+        let in_dir = self.resolve(input_dir)?;
+        let out_res = self.resolve_destination(out_dir)?;
+        std::fs::create_dir_all(&out_res)
+            .map_err(|e| AppError::Io("create batch output dir".to_string(), e))?;
+
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&in_dir)
+            .map_err(|e| AppError::Io("read batch input dir".to_string(), e))?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        let mut results: Vec<BatchResult> = Vec::new();
+        let mut processed = 0u32;
+        for entry in &entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.to_lowercase().ends_with(".pdf") {
+                continue;
+            }
+            let source = entry.path();
+            let dest = out_res.join(&name);
+            // Batch ops re-save documents; an encrypted source would need a
+            // password the batch contract does not carry, so refuse it up
+            // front instead of writing a broken file.
+            if let Ok(probe) = Document::load(&source)
+                && probe.is_encrypted()
+            {
+                results.push(BatchResult {
+                    file: name,
+                    status: "error",
+                    output_file: None,
+                    error: Some("encrypted file: decrypt it first, then batch".into()),
+                });
+                continue;
+            }
+            let run = match op_name {
+                "compress" => self.compress(&source, &dest, 9).map(|_| ()),
+                "repair" => self.repair(&source, &dest).map(|_| ()),
+                "pagenum" => self.page_numbers(&source, &dest).map(|_| ()),
+                _ => unreachable!("validated above"),
+            };
+            match run {
+                Ok(()) => {
+                    processed += 1;
+                    results.push(BatchResult {
+                        file: name,
+                        status: "success",
+                        output_file: Some(display_path(&dest)),
+                        error: None,
+                    });
+                }
+                Err(e) => results.push(BatchResult {
+                    file: name,
+                    status: "error",
+                    output_file: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        if results.is_empty() {
+            return Err(AppError::Operation("no .pdf files in the input directory".into()));
+        }
+
+        Ok(BatchReport {
+            status: "success",
+            operation: "batch",
+            input_dir: display_path(&in_dir),
+            output_dir: display_path(&out_res),
+            processed,
+            results,
+        })
+    }
+
     // ---- small builders shared by watermark / page-numbers / from-images ----
 
     fn font_object() -> Dictionary {
@@ -1426,6 +1664,26 @@ fn zlib_compress_level(bytes: &[u8], level: u32) -> AppResult<Vec<u8>> {
         .map_err(|e| AppError::Operation(format!("zlib finish: {e}")))
 }
 
+/// A pseudo-unique 16-hex-digit file identifier for the trailer /ID array.
+fn make_file_id(source: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Hash::hash(
+        &format!(
+            "{}:{}:{}",
+            source.display(),
+            std::process::id(),
+            now
+        ),
+        &mut hasher,
+    );
+    format!("{:016x}", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1715,5 +1973,116 @@ mod tests {
         let (engine, src) = three_page_doc();
         let err = engine.compress(&src, Path::new("c.pdf"), 10).unwrap_err();
         assert!(matches!(err, AppError::Operation(_)));
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_roundtrip() {
+        let (engine, src) = three_page_doc();
+        let enc_report = engine
+            .encrypt(&src, "secret", "secret", Path::new("secret.pdf"))
+            .unwrap();
+        assert_eq!(enc_report.pages, 3);
+        assert!(enc_report.encrypted);
+
+        let enc_path = engine.root().join("secret.pdf");
+        let loaded = Document::load(&enc_path).unwrap();
+        assert!(loaded.is_encrypted());
+
+        // Wrong password is rejected before a byte is written.
+        let err = engine
+            .decrypt(&enc_path, "nope", Path::new("x.pdf"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+
+        let dec_report = engine
+            .decrypt(&enc_path, "secret", Path::new("plain-again.pdf"))
+            .unwrap();
+        assert!(!dec_report.encrypted);
+        let plain = Document::load(engine.root().join("plain-again.pdf")).unwrap();
+        assert!(!plain.is_encrypted());
+        assert_eq!(plain.get_pages().len(), 3);
+
+        // Re-encrypting an encrypted document is refused.
+        let err = engine
+            .encrypt(&enc_path, "a", "b", Path::new("x.pdf"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+    }
+
+    #[test]
+    fn repair_rescues_truncated_document() {
+        let (engine, files) = three_samples();
+        let bytes = std::fs::read(&files[0]).unwrap();
+        // Chop the tail (drops %%EOF and part of the xref area).
+        let damaged = &bytes[..bytes.len() - 6];
+        let damaged_path = engine.root().join("damaged.pdf");
+        std::fs::write(&damaged_path, damaged).unwrap();
+
+        let report = engine
+            .repair(&damaged_path, Path::new("repaired.pdf"))
+            .unwrap();
+        assert_eq!(report.pages, 1);
+        let reloaded = Document::load(engine.root().join("repaired.pdf")).unwrap();
+        assert_eq!(reloaded.get_pages().len(), 1);
+
+        // Garbage that is not a PDF at all is refused.
+        let garbage = engine.root().join("garbage.pdf");
+        std::fs::write(&garbage, b"this is definitely not a pdf").unwrap();
+        assert!(engine.repair(&garbage, Path::new("nope.pdf")).is_err());
+    }
+
+    #[test]
+    fn batch_runs_op_over_every_pdf() {
+        let (engine, files) = three_samples();
+        let report = engine.batch(engine.root(), "compress", Path::new("batch-out")).unwrap();
+        assert_eq!(report.processed, 3);
+        assert_eq!(report.results.len(), 3);
+        for r in &report.results {
+            assert_eq!(r.status, "success", "{r:?}");
+            let out = engine.root().join("batch-out").join(&r.file);
+            assert!(out.exists(), "missing {out:?}");
+        }
+        // File order in the report is sorted by name.
+        let names: Vec<&str> = report.results.iter().map(|r| r.file.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        let _ = &files;
+    }
+
+    #[test]
+    fn batch_rejects_unknown_ops_and_empty_dirs() {
+        let (engine, _files) = three_samples();
+        let err = engine
+            .batch(engine.root(), "merge", Path::new("o"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+
+        let empty = engine.root().join("empty-dir");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = engine
+            .batch(&empty, "compress", Path::new("o"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+    }
+
+    #[test]
+    fn batch_flags_encrypted_files() {
+        let (engine, files) = three_samples();
+        engine
+            .encrypt(&files[0], "pw", "pw", Path::new("secret-batch.pdf"))
+            .unwrap();
+        let report = engine
+            .batch(engine.root(), "compress", Path::new("bo"))
+            .unwrap();
+        let flagged = report
+            .results
+            .iter()
+            .find(|r| r.file == "secret-batch.pdf")
+            .unwrap();
+        assert_eq!(flagged.status, "error");
+        assert!(flagged.error.is_some());
+        // The other three files still processed successfully.
+        assert_eq!(report.processed, 3);
     }
 }

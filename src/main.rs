@@ -103,6 +103,34 @@ struct Cli {
     #[arg(long)]
     level: Option<u32>,
 
+    /// Source document to encrypt with AES-128 (agent mode; needs --password).
+    #[arg(long)]
+    encrypt: Option<PathBuf>,
+
+    /// Source document to decrypt (agent mode; needs --password).
+    #[arg(long)]
+    decrypt: Option<PathBuf>,
+
+    /// User password for --encrypt, or the password for --decrypt.
+    #[arg(long)]
+    password: Option<String>,
+
+    /// Owner password for --encrypt (default: same as --password).
+    #[arg(long)]
+    owner_password: Option<String>,
+
+    /// Source document for xref repair / clean re-save (agent mode).
+    #[arg(long)]
+    repair: Option<PathBuf>,
+
+    /// Directory of PDFs to run --op over, in sorted name order (agent mode).
+    #[arg(long)]
+    batch: Option<PathBuf>,
+
+    /// Operation for --batch: compress | repair | pagenum.
+    #[arg(long)]
+    op: Option<String>,
+
     /// 1-based page ranges, e.g. `1-3,5` (agent mode, with --split / --rotate / --delete-pages / --extract-text).
     #[arg(long)]
     pages: Option<String>,
@@ -152,6 +180,9 @@ enum AgentOutcome {
     Info(engine::InfoReport),
     ExtractText(engine::ExtractTextReport),
     ExtractImages(engine::ExtractImagesReport),
+    Encrypt(engine::EncryptionReport),
+    Repair(engine::RepairReport),
+    Batch(engine::BatchReport),
 }
 
 /// Agent mode: one operation, one JSON document on stdout, status as exit code.
@@ -245,6 +276,41 @@ fn run_agent(cli: &Cli, engine: &Engine) -> i32 {
         let output = default_output(cli, "compressed.pdf");
         let level = cli.level.unwrap_or(9);
         ("compress", engine.compress(source, &output, level).map(AgentOutcome::Op))
+    } else if let Some(source) = &cli.encrypt {
+        let output = default_output(cli, "encrypted.pdf");
+        let user_pw = match &cli.password {
+            Some(p) => p.clone(),
+            None => return agent_error("encrypt", "--encrypt requires --password <string>"),
+        };
+        let owner_pw = cli.owner_password.clone().unwrap_or(user_pw.clone());
+        (
+            "encrypt",
+            engine.encrypt(source, &user_pw, &owner_pw, &output).map(AgentOutcome::Encrypt),
+        )
+    } else if let Some(source) = &cli.decrypt {
+        let output = default_output(cli, "decrypted.pdf");
+        let pw = match &cli.password {
+            Some(p) => p.clone(),
+            None => return agent_error("decrypt", "--decrypt requires --password <string>"),
+        };
+        ("decrypt", engine.decrypt(source, &pw, &output).map(AgentOutcome::Encrypt))
+    } else if let Some(source) = &cli.repair {
+        let output = default_output(cli, "repaired.pdf");
+        ("repair", engine.repair(source, &output).map(AgentOutcome::Repair))
+    } else if let Some(dir) = &cli.batch {
+        let op_name = match &cli.op {
+            Some(o) => o.clone(),
+            None => {
+                return agent_error("batch", "--batch requires --op <compress|repair|pagenum>")
+            }
+        };
+        let out_dir = cli.out_dir.clone().unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{}-out",
+                dir.file_stem().and_then(|s| s.to_str()).unwrap_or("batch")
+            ))
+        });
+        ("batch", engine.batch(dir, &op_name, &out_dir).map(AgentOutcome::Batch))
     } else if let Some(source) = &cli.info {
         ("info", engine.info(source).map(AgentOutcome::Info))
     } else if let (Some(source), Some(spec)) = (&cli.split, &cli.pages) {
@@ -261,6 +327,8 @@ fn run_agent(cli: &Cli, engine: &Engine) -> i32 {
              | --info <file> | --watermark <file> --text <str> | --pagenum <file> \
              | --set-metadata <file> --meta K=V… | --extract-text <file> [--pages r] [--output f] \
              | --extract-images <file> [--out-dir d] | --from-images <img…> [--output f] \
+             | --encrypt <file> --password <pw> [--owner-password <pw>] | --decrypt <file> --password <pw> \
+             | --repair <file> | --batch <dir> --op compress|repair|pagenum [--out-dir d] \
              (all may take --workspace <dir>)",
         );
     };
@@ -274,6 +342,9 @@ fn run_agent(cli: &Cli, engine: &Engine) -> i32 {
         Ok(AgentOutcome::Info(report)) => print_json(&report),
         Ok(AgentOutcome::ExtractText(report)) => print_json(&report),
         Ok(AgentOutcome::ExtractImages(report)) => print_json(&report),
+        Ok(AgentOutcome::Encrypt(report)) => print_json(&report),
+        Ok(AgentOutcome::Repair(report)) => print_json(&report),
+        Ok(AgentOutcome::Batch(report)) => print_json(&report),
         Err(e) => agent_error(operation, &e.to_string()),
     }
 }

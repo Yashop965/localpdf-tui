@@ -7,7 +7,7 @@ fast Rust binary, with two frontends over the same engine:
 - a polished **TUI dashboard** for humans,
 - a deterministic **JSON CLI** for AI agents.
 
-## Features (v0.3)
+## Features (v0.4)
 
 | Operation | TUI | Agent mode |
 |---|---|---|
@@ -24,6 +24,10 @@ fast Rust binary, with two frontends over the same engine:
 | Extract text | ✓ | `--json --extract-text in.pdf [--pages 1-2]` |
 | Extract images | ✓ | `--json --extract-images in.pdf [--out-dir dir]` |
 | Assemble images → PDF | agent | `--json --from-images a.png b.jpg` |
+| Encrypt (AES-128) | agent | `--json --encrypt in.pdf --password pw [--owner-password pw]` |
+| Decrypt | agent | `--json --decrypt in.pdf --password pw` |
+| Repair (xref recovery + clean re-save) | agent | `--json --repair damaged.pdf` |
+| Batch one op over a directory | agent | `--json --batch dir --op compress\|repair\|pagenum [--out-dir d]` |
 | Generate sample PDF | `[a]` key | `engine::generate_sample` (used by tests/demo) |
 
 See [`PRD.md`](./PRD.md) for the full feature roadmap (compress, rotate,
@@ -39,6 +43,7 @@ TUI keys:
 
 ```
 [a]      queue a freshly generated sample PDF
+[f]      add a real PDF from disk (type its path, [enter] to queue)
 [←][→]   focus between File Queue / Operations
 [↑][↓]   move cursor
 [enter]  run the selected operation
@@ -71,6 +76,21 @@ localpdf-tui --json --extract-text big.pdf --pages 1-3
 # stamp every page with a diagonal DRAFT
 localpdf-tui --json --watermark big.pdf --text DRAFT --output big-draft.pdf
 # → {"status":"success","operation":"watermark","output_file":"...\\big-draft.pdf","pages":42}
+
+# lock a file behind a user + owner password (AES-128)
+localpdf-tui --json --encrypt big.pdf --password s3cret --owner-password ow --output locked.pdf
+# → {"status":"success","operation":"encrypt","pages":42,"encrypted":true,"algorithm":"AES-128"}
+
+# remove the lock again (wrong passwords are refused with status "error")
+localpdf-tui --json --decrypt locked.pdf --password s3cret --output open.pdf
+
+# rescue a truncated/corrupt file: lenient load, xref recovery, clean re-save
+localpdf-tui --json --repair damaged.pdf
+# → {"status":"success","operation":"repair","pages":42,"recovered":true,"recovery_kind":"reconstructed"}
+
+# run one op over a whole directory (sorted order, per-file results)
+localpdf-tui --json --batch D:\pdfs --op compress --out-dir D:\pdfs-slim
+# → {"status":"success","operation":"batch","processed":12,"results":[{"file":"a.pdf","status":"success",…},…]}
 
 # on failure the only shape is:
 # → {"status":"error","operation":"split","error":"page 4 is beyond the end of a 3-page document"}
@@ -112,7 +132,7 @@ anything we create. Both then enforce containment under the workspace root —
 
 ```bash
 cargo build
-cargo test   # engine unit tests: merge/split/ranges/escape
+cargo test   # engine unit tests + headless TUI key-event tests
 ```
 
 Rust 1.85+ (lopdf uses edition 2024 features).

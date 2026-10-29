@@ -2,7 +2,7 @@
 //! panic-safe restoration, and the event loop that feeds `App`.
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{Event, KeyCode, KeyModifiers, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -58,6 +58,14 @@ pub enum Panel {
     Ops,
 }
 
+/// Top-level input mode: either the dashboard, or the add-file path
+/// prompt started with `[f]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    AddFile,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Info,
@@ -82,6 +90,8 @@ pub struct App {
     pub ops_index: usize,
     pub focus: Panel,
     pub ctx_input: String,
+    pub mode: Mode,
+    pub file_input: String,
     pub log: VecDeque<String>,
     sample_counter: u32,
     should_quit: bool,
@@ -97,13 +107,15 @@ impl App {
             ops_index: 0,
             focus: Panel::Queue,
             ctx_input: String::new(),
+            mode: Mode::Normal,
+            file_input: String::new(),
             log: VecDeque::new(),
             sample_counter: 0,
             should_quit: false,
         };
         app.set_log(
             StatusKind::Info,
-            "ready — [a] add sample · [←][→] focus · [↑][↓] move · [enter] run · [q] quit",
+            "ready — [a] add sample · [f] add file · [←][→] focus · [↑][↓] move · [enter] run · [q] quit",
         );
         app
     }
@@ -153,6 +165,48 @@ impl App {
             }
             Err(e) => self.set_log(StatusKind::Error, &format!("sample generation failed: {e}")),
         }
+    }
+
+    /// `[f]` — start the add-file prompt: type any path (workspace-relative
+    /// or absolute) into the bottom input line, confirm with [enter].
+    fn start_add_file(&mut self) {
+        self.mode = Mode::AddFile;
+        self.file_input.clear();
+        self.focus = Panel::Queue;
+        self.set_log(
+            StatusKind::Info,
+            "add file: type a path (relative to the workspace, or absolute) — [enter] add · [esc] cancel",
+        );
+    }
+
+    /// Commit the typed path: resolve it through the sandbox engine and
+    /// queue it. Rejected paths (outside the workspace, missing) log an
+    /// error and drop back to the dashboard.
+    fn commit_add_file(&mut self) {
+        let spec = self.file_input.trim().to_string();
+        self.mode = Mode::Normal;
+        self.file_input.clear();
+        if spec.is_empty() {
+            self.set_log(StatusKind::Error, "empty path — nothing added");
+            return;
+        }
+        let path = match self.engine.resolve(Path::new(&spec)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_log(StatusKind::Error, &format!("cannot add '{spec}': {e}"));
+                return;
+            }
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size_kb = path.metadata().map(|m| m.len() / 1024).unwrap_or(0);
+        self.queue.push(QueueEntry { path, size_kb });
+        self.rebuild_queue_lines();
+        self.q_index = self.queue.len() - 1;
+        self.focus = Panel::Queue;
+        self.set_log(StatusKind::Ok, &format!("added {name} ({size_kb} KB)"));
     }
 
     /// The highlighted queue file (bounds-checked) — the source for every
@@ -492,6 +546,26 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // The add-file prompt consumes the keyboard until [enter]/[esc].
+        if self.mode == Mode::AddFile {
+            match key.code {
+                KeyCode::Esc => self.start_cancel_add_file(),
+                KeyCode::Enter => self.commit_add_file(),
+                KeyCode::Backspace => {
+                    self.file_input.pop();
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii()
+                        && !c.is_ascii_control()
+                        && self.file_input.len() < 160 =>
+                {
+                    self.file_input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let plain = key.modifiers == KeyModifiers::NONE;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -499,6 +573,7 @@ impl App {
             KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('a') if plain => self.add_sample(),
+            KeyCode::Char('f') if plain => self.start_add_file(),
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Down => self.move_cursor(1),
             KeyCode::Left | KeyCode::BackTab => self.switch_focus(Panel::Queue),
@@ -512,6 +587,13 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// [esc] inside the add-file prompt cancels it (not the app).
+    fn start_cancel_add_file(&mut self) {
+        self.mode = Mode::Normal;
+        self.file_input.clear();
+        self.set_log(StatusKind::Info, "add-file cancelled");
     }
 
     pub fn should_quit(&self) -> bool {
@@ -538,7 +620,11 @@ pub fn run(mut app: App) -> AppResult<()> {
         }
         if crossterm::event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = crossterm::event::read()? {
-                app.handle_key(key);
+                // Windows reports every physical keypress as a Press *and*
+                // a Release; acting on both double-fired every operation.
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    app.handle_key(key);
+                }
             }
         }
     }

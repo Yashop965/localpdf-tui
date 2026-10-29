@@ -85,3 +85,44 @@ fn extract_text_via_keys_reports_chars() {
     assert!(last.contains("extracted"), "last log line was: {last}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn add_file_via_keys_queues_real_file() {
+    let dir = sample_workspace("addfile");
+    let engine = localpdf_tui::engine::Engine::new(std::path::Path::new(&dir)).unwrap();
+    let mut app = tui::App::new(engine);
+    app.handle_key(key(KeyCode::Char('a'))); // queue sample_1.pdf
+    let name = app
+        .queue
+        .last()
+        .unwrap()
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // [f] → type the path → [enter] queues it again.
+    app.handle_key(key(KeyCode::Char('f')));
+    assert_eq!(app.mode, tui::Mode::AddFile);
+    type_str(&mut app, &name);
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.mode, tui::Mode::Normal);
+    assert_eq!(app.queue.len(), 2);
+
+    // [esc] cancels the prompt without touching the queue.
+    app.handle_key(key(KeyCode::Char('f')));
+    type_str(&mut app, &name);
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.mode, tui::Mode::Normal);
+    assert_eq!(app.queue.len(), 2);
+
+    // A path outside the sandbox is rejected with an error log.
+    app.handle_key(key(KeyCode::Char('f')));
+    type_str(&mut app, "C:\\Windows\\win.ini");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.mode, tui::Mode::Normal);
+    assert_eq!(app.queue.len(), 2);
+    let last = app.log.iter().last().cloned().unwrap_or_default();
+    assert!(last.contains("cannot add"), "last log line was: {last}");
+}
