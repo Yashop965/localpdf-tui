@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::{App, OPS, OPS_DESC, Panel};
+use crate::tui::{App, HAS_RANGE_INPUT, OPS, OPS_DESC, Panel, ROTATE_INPUT};
 
 /// Palette. Tweak here and the whole dashboard re-skins.
 const ACCENT: Color = Color::Cyan;
@@ -83,18 +83,21 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
 }
 
 fn render_ops(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let split = Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).split(area);
+    let split = Layout::vertical([Constraint::Length(8), Constraint::Length(1)]).split(area);
 
     let ops_block = bordered_block(" OPERATIONS ");
     let active = app.focus == Panel::Ops;
     let lines: Vec<Line> = (0..OPS.len())
         .map(|i| {
             let marker = if active && i == app.ops_index { "▸" } else { " " };
-            let unavailable = i == OPS.len() - 1;
             let op_style = Style::default()
-                .fg(if unavailable { DIM } else { Color::White })
-                .add_modifier(if active && i == app.ops_index { Modifier::BOLD } else { Modifier::empty() });
-            let desc_style = Style::default().fg(if unavailable { DIM } else { Color::Rgb(139, 148, 158) });
+                .fg(Color::White)
+                .add_modifier(if active && i == app.ops_index {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            let desc_style = Style::default().fg(Color::Rgb(139, 148, 158));
             Line::from(vec![
                 Span::styled(format!("{marker}  {}", OPS[i]), op_style),
                 Span::raw("  "),
@@ -111,18 +114,38 @@ fn render_ops(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
         .highlight_style(Style::default().bg(SEL_BG).fg(Color::White).add_modifier(Modifier::BOLD));
     f.render_widget(list, split[0]);
 
-    let spec_selected = active && app.ops_index == 1;
-    let caret = if spec_selected { "▏" } else { " " };
-    let label = Span::styled(
-        "SPLIT RANGES  ",
-        Style::default().fg(if spec_selected { ACCENT } else { DIM }).add_modifier(Modifier::BOLD),
-    );
-    let value = Span::styled(
-        format!("[ {}{} ]", app.split_spec, caret),
-        Style::default().fg(if spec_selected { Color::White } else { DIM }),
-    );
-    let help = Span::styled("   1-based, e.g. 1-3,5 — applied to the highlighted queue file", Style::default().fg(DIM));
-    let input = Paragraph::new(Line::from(vec![label, value, help])).style(Style::default().bg(PANEL_BG));
+    // Context input line: label + editable value, active only for ops that
+    // take input (split / rotate / delete).
+    let op = app.ops_index;
+    let takes_input = HAS_RANGE_INPUT.contains(&op) || op == ROTATE_INPUT;
+    let spec_selected = active && takes_input;
+    let label = match op {
+        1 => "SPLIT RANGES     ",
+        ROTATE_INPUT => "ROTATE RANGES:DEG ",
+        4 => "DELETE PAGES     ",
+        _ => " CONTEXT         ",
+    };
+    let value = match op {
+        1 | 4 => format!("[ {}▏ ]", app.ctx_input),
+        ROTATE_INPUT => format!("[ {}▏ ]", app.ctx_input),
+        _ => "[        ]".to_string(),
+    };
+    let help = match op {
+        1 => "   1-based, e.g. 1-3,5 — applied to the highlighted file",
+        ROTATE_INPUT => "   e.g. 1,3:90 — pages and angle for the highlighted file",
+        4 => "   1-based, e.g. 2,4-5 — removes pages from the highlighted file",
+        _ => "   no input — [enter] runs on the highlighted file",
+    };
+    let label_style = Style::default()
+        .fg(if spec_selected { ACCENT } else { DIM })
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(if spec_selected { Color::White } else { DIM });
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled(label, label_style),
+        Span::styled(value, value_style),
+        Span::styled(help, Style::default().fg(DIM)),
+    ]))
+    .style(Style::default().bg(PANEL_BG));
     f.render_widget(input, split[1]);
 }
 

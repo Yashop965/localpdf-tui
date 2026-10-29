@@ -63,10 +63,10 @@ Rules for M1+:
 
 ## 5. Feature roadmap ("the things we actually use locally")
 
-### P0 — v0.2 (M1, next class)
+### P0 — v0.2 (M1, next class) — **shipped 2026-10-28**
 | Op | CLI flag | Notes |
 |---|---|---|
-| Compress | `--json --compress in.pdf [--level 1-9]` | Flate on streams + drop orphaned objects (re-run the closure-copy to keep only reachable objects) |
+| Compress | `--json --compress in.pdf` | drop orphaned objects (closure-copy keep-only-reachable) + Flate-compress unfiltered streams. (`--level` deferred — `lopdf::Stream::compress` pins level 9; revisit when we control the encoder) |
 | Rotate | `--json --rotate in.pdf --pages 1,3-5 --degrees 90\|180\|270` | set `/Rotate` on selected page dicts |
 | Reorder | `--json --reorder in.pdf --order 3,1,2` | rewrite root Kids array |
 | Delete pages | `--json --delete-pages in.pdf --pages 2,4-5` | split's inverse: keep-complement, same minimal-copy path |
@@ -163,7 +163,8 @@ order (`3,1,2`), text. Invalid input never executes; it flashes in the log.
 ## 10. Milestones
 
 - **M0 — done:** skeleton, merge, split, agent JSON, sandbox, samples, 5 tests.
-- **M1 (v0.2):** compress, rotate, reorder, delete-pages, info + TUI wiring + tests.
+- **M1 — done (2026-10-28):** compress, rotate, reorder, delete-pages, info +
+  TUI wiring (6-op dashboard, per-op context input) + 11 tests + CLI smoke.
 - **M2 (v0.3):** text/image extraction, watermark, page numbers, metadata, image↔PDF.
 - **M3:** encryption, repair, watch/batch, config, release packaging.
 

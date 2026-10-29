@@ -36,6 +36,20 @@ pub struct OperationReport {
     pub pages: u32,
 }
 
+/// Read-only document report for the `info` operation.
+#[derive(Debug, Serialize)]
+pub struct InfoReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub source_file: String,
+    pub pages: u32,
+    pub file_size_bytes: u64,
+    pub object_count: usize,
+    pub encrypted: bool,
+    pub title: Option<String>,
+    pub creator: Option<String>,
+}
+
 /// Inclusive 1-based page range: `start..=end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -220,7 +234,7 @@ impl Engine {
         Ok(OperationReport {
             status: "success",
             operation: "merge",
-            output_file: written.display().to_string(),
+            output_file: display_path(&written),
             pages: total_pages,
         })
     }
@@ -239,15 +253,100 @@ impl Engine {
         output: &Path,
     ) -> AppResult<OperationReport> {
         let src = self.load_pdf(input)?;
-        let pages: BTreeMap<u32, ObjectId> = src.get_pages();
-        let total = pages.len() as u32;
+        let selected = Self::select_pages(&src, ranges)?;
+        if selected.is_empty() {
+            return Err(AppError::Operation("no pages matched the range spec".into()));
+        }
+
+        let mut doc = Self::build_extracted_document(&src, &selected)?;
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "split",
+            output_file: display_path(&written),
+            pages: selected.len() as u32,
+        })
+    }
+
+    /// Delete the pages selected by `ranges_spec` (e.g. `2,4-5`), keeping the
+    /// rest in document order. The inverse of split — same minimal-copy
+    /// machinery, applied to the complement.
+    pub fn delete_pages(
+        &self,
+        input: &Path,
+        ranges_spec: &str,
+        output: &Path,
+    ) -> AppResult<OperationReport> {
+        let ranges = parse_ranges(ranges_spec)?;
+        let src = self.load_pdf(input)?;
+        let pages_map = src.get_pages();
+        let total = pages_map.len() as u32;
         if total == 0 {
             return Err(AppError::Operation("document contains no pages".into()));
         }
 
-        let mut used: HashSet<u32> = HashSet::new();
-        let mut selected: Vec<ObjectId> = Vec::new();
-        for r in ranges {
+        let mut drop: HashSet<u32> = HashSet::new();
+        for r in &ranges {
+            if r.start > total {
+                return Err(AppError::PageRange(format!(
+                    "page {} is beyond the end of a {}-page document",
+                    r.start, total
+                )));
+            }
+            drop.extend(r.start..=r.end.min(total));
+        }
+
+        let mut keep: Vec<ObjectId> = Vec::new();
+        for n in 1..=total {
+            if !drop.contains(&n) {
+                keep.push(
+                    *pages_map
+                        .get(&n)
+                        .ok_or_else(|| AppError::PageRange(format!("page {n} missing from page tree")))?,
+                );
+            }
+        }
+        if keep.is_empty() {
+            return Err(AppError::Operation("cannot delete every page of a document".into()));
+        }
+
+        let mut doc = Self::build_extracted_document(&src, &keep)?;
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "delete",
+            output_file: display_path(&written),
+            pages: keep.len() as u32,
+        })
+    }
+
+    /// Rotate the pages selected by `ranges_spec` by `degrees` (90/180/270),
+    /// writing the result to `output`. All other pages carry over unchanged.
+    pub fn rotate(
+        &self,
+        input: &Path,
+        ranges_spec: &str,
+        degrees: u32,
+        output: &Path,
+    ) -> AppResult<OperationReport> {
+        match degrees {
+            90 | 180 | 270 => {}
+            _ => {
+                return Err(AppError::PageRange(format!(
+                    "--degrees must be 90, 180, or 270 (got {degrees})"
+                )))
+            }
+        }
+        let ranges = parse_ranges(ranges_spec)?;
+        let mut src = self.load_pdf(input)?;
+        let pages_map = src.get_pages();
+        let total = pages_map.len() as u32;
+        if total == 0 {
+            return Err(AppError::Operation("document contains no pages".into()));
+        }
+
+        let mut rotated = 0u32;
+        for r in &ranges {
             if r.start > total {
                 return Err(AppError::PageRange(format!(
                     "page {} is beyond the end of a {}-page document",
@@ -255,68 +354,203 @@ impl Engine {
                 )));
             }
             for n in r.start..=r.end.min(total) {
-                let id = *pages
+                let id = *pages_map
                     .get(&n)
                     .ok_or_else(|| AppError::PageRange(format!("page {n} missing from page tree")))?;
-                if used.insert(n) {
-                    selected.push(id);
+                src.get_dictionary_mut(id)
+                    .map_err(|e| AppError::Pdf(e.to_string()))?
+                    .set("Rotate", Object::Integer(degrees as i64));
+                rotated += 1;
+            }
+        }
+        if rotated == 0 {
+            return Err(AppError::Operation("no pages matched the range spec".into()));
+        }
+
+        let written = self.save_pdf(&mut src, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "rotate",
+            output_file: display_path(&written),
+            pages: rotated,
+        })
+    }
+
+    /// Reorder every page: `order_spec` must list all page numbers exactly
+    /// once (e.g. `3,1,2`). The output keeps the full document, with the
+    /// root page tree rebuilt in the requested order.
+    pub fn reorder(&self, input: &Path, order_spec: &str, output: &Path) -> AppResult<OperationReport> {
+        let src = self.load_pdf(input)?;
+        let pages_map = src.get_pages();
+        let total = pages_map.len() as u32;
+        if total == 0 {
+            return Err(AppError::Operation("document contains no pages".into()));
+        }
+
+        let spec = order_spec.trim();
+        if spec.is_empty() {
+            return Err(AppError::Operation(
+                "--order must list every page exactly once, e.g. 3,1,2".into(),
+            ));
+        }
+        let mut nums: Vec<u32> = Vec::new();
+        for token in spec.split(',') {
+            let token = token.trim();
+            let n: u32 = token
+                .parse()
+                .map_err(|_| AppError::PageRange(format!("'{}' is not a page number", token)))?;
+            if n == 0 || n > total {
+                return Err(AppError::PageRange(format!(
+                    "page {n} is outside 1..{total}"
+                )));
+            }
+            nums.push(n);
+        }
+        if nums.len() != total as usize {
+            return Err(AppError::Operation(format!(
+                "--order must contain exactly {total} entries (one per page, found {})",
+                nums.len()
+            )));
+        }
+        let mut seen: HashSet<u32> = HashSet::new();
+        for &n in &nums {
+            if !seen.insert(n) {
+                return Err(AppError::Operation(format!("page {n} appears twice in --order")));
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(nums.len());
+        for &n in &nums {
+            ordered.push(
+                *pages_map
+                    .get(&n)
+                    .ok_or_else(|| AppError::PageRange(format!("page {n} missing from page tree")))?,
+            );
+        }
+
+        let mut doc = Self::build_extracted_document(&src, &ordered)?;
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "reorder",
+            output_file: display_path(&written),
+            pages: total,
+        })
+    }
+
+    /// Compress: keep only objects reachable from the catalog (orphaned
+    /// objects from incremental updates are dropped) and Flate-compress
+    /// every unfiltered stream that gets smaller.
+    pub fn compress(&self, input: &Path, output: &Path) -> AppResult<OperationReport> {
+        let src = self.load_pdf(input)?;
+        let root_ref = src
+            .trailer
+            .get(b"Root")
+            .map_err(|e| AppError::Pdf(e.to_string()))?;
+        let catalog_id = match root_ref {
+            Object::Reference(id) => *id,
+            _ => return Err(AppError::Pdf("trailer /Root is not an indirect reference".into())),
+        };
+
+        let mut starts = vec![catalog_id];
+        if let Ok(info_ref) = src.trailer.get(b"Info") {
+            if let Object::Reference(id) = info_ref {
+                starts.push(*id);
+            }
+        }
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut closure: Vec<ObjectId> = Vec::new();
+        for &start in &starts {
+            Self::expand_closure(&src, start, true, &mut seen, &mut closure);
+        }
+
+        let mut out = Document::with_version(src.version.clone());
+        let mut map: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for &id in &closure {
+            map.insert(id, out.new_object_id());
+        }
+        for &id in &closure {
+            let obj = src.objects.get(&id).cloned().unwrap_or(Object::Null);
+            let copied = Self::remap_object(&obj, &src, &mut map, &mut out);
+            out.objects.insert(map[&id], copied);
+        }
+
+        out.trailer.set("Root", map[&catalog_id]);
+        if let Ok(info_ref) = src.trailer.get(b"Info") {
+            if let Object::Reference(id) = info_ref {
+                if let Some(&new_id) = map.get(&id) {
+                    out.trailer.set("Info", new_id);
+                }
+            }
+        }
+        if let Ok(id_value) = src.trailer.get(b"ID") {
+            out.trailer.set("ID", id_value.clone());
+        }
+
+        for value in out.objects.values_mut() {
+            if let Object::Stream(stream) = value {
+                // Skip streams that are already filtered; `compress` only
+                // shrinks when the result is actually smaller.
+                if stream.dict.get(b"Filter").is_err() {
+                    let _ = stream.compress();
                 }
             }
         }
 
-        let mut merged = Document::with_version("1.7");
-        let root_pages = merged.new_object_id();
+        let pages = src.get_pages().len() as u32;
+        let written = self.save_pdf(&mut out, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "compress",
+            output_file: display_path(&written),
+            pages,
+        })
+    }
 
-        let mut seen: HashSet<ObjectId> = HashSet::new();
-        let mut closure: Vec<ObjectId> = Vec::new();
-        for &page in &selected {
-            Self::expand_closure(&src, page, false, &mut seen, &mut closure);
-        }
-        let mut map: HashMap<ObjectId, ObjectId> = HashMap::new();
-        for &id in &closure {
-            map.insert(id, merged.new_object_id());
-        }
-        for &id in &closure {
-            let obj = src.objects.get(&id).cloned().unwrap_or(Object::Null);
-            let copied = Self::remap_object(&obj, &src, &mut map, &mut merged);
-            merged.objects.insert(map[&id], copied);
-        }
-        for &page in &selected {
-            if let Some(Object::Dictionary(d)) = merged.objects.get_mut(&map[&page]) {
-                d.set("Parent", root_pages);
+    /// Read-only document report: page count, byte size, encryption state,
+    /// metadata and object-table size. No file is written.
+    pub fn info(&self, input: &Path) -> AppResult<InfoReport> {
+        let resolved = self.resolve(input)?;
+        let doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+        let file_size_bytes = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+
+        let mut title: Option<String> = None;
+        let mut creator: Option<String> = None;
+        if let Ok(info_ref) = doc.trailer.get(b"Info") {
+            if let Object::Reference(id) = info_ref {
+                if let Ok(d) = doc.get_dictionary(*id) {
+                    if let Some(t) = Self::dict_text(d.get(b"Title").ok()) {
+                        title = Some(t);
+                    }
+                    if let Some(c) = Self::dict_text(d.get(b"Creator").ok()) {
+                        creator = Some(c);
+                    }
+                }
             }
         }
 
-        // Carry the media box from the source root when present so viewers
-        // fall back to the document's own page size instead of a default.
-        let media_box = Self::root_pages_id(&src)
-            .ok()
-            .and_then(|id| src.get_dictionary(id).ok())
-            .and_then(|d| d.get(b"MediaBox").ok())
-            .cloned();
-        let mut root_dict = dictionary! {
-            "Type" => "Pages",
-            "Kids" => Object::Array(selected.iter().map(|id| Object::Reference(map[id])).collect()),
-            "Count" => Object::Integer(selected.len() as i64),
-        };
-        if let Some(box_obj) = media_box {
-            root_dict.set("MediaBox", box_obj);
-        }
-        merged.objects.insert(root_pages, Object::Dictionary(root_dict));
-
-        let catalog_id = merged.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => root_pages,
-        });
-        merged.trailer.set("Root", catalog_id);
-
-        let written = self.save_pdf(&mut merged, output)?;
-        Ok(OperationReport {
+        Ok(InfoReport {
             status: "success",
-            operation: "split",
-            output_file: written.display().to_string(),
-            pages: selected.len() as u32,
+            operation: "info",
+            source_file: display_path(&resolved),
+            pages: doc.get_pages().len() as u32,
+            file_size_bytes,
+            object_count: doc.objects.len(),
+            encrypted: doc.is_encrypted(),
+            title,
+            creator,
         })
+    }
+
+    /// Decode a metadata value, which may be a PDF `Name` or a literal
+    /// `String`, into lossy UTF-8.
+    fn dict_text(obj: Option<&Object>) -> Option<String> {
+        let s = match obj? {
+            Object::Name(bytes) => bytes,
+            Object::String(bytes, _) => bytes,
+            _ => return None,
+        };
+        Some(String::from_utf8_lossy(s).into_owned())
     }
 
     /// Create a single-page sample document at `name` (workspace-relative).
@@ -386,6 +620,95 @@ impl Engine {
             Object::Reference(id) => Ok(*id),
             _ => Err(AppError::Pdf("/Pages is not an indirect reference".into())),
         }
+    }
+
+    /// Validate `ranges` against the document and return the selected page
+    /// object ids in document order, de-duplicated.
+    fn select_pages(src: &Document, ranges: &[Range]) -> AppResult<Vec<ObjectId>> {
+        let pages: BTreeMap<u32, ObjectId> = src.get_pages();
+        let total = pages.len() as u32;
+        if total == 0 {
+            return Err(AppError::Operation("document contains no pages".into()));
+        }
+
+        let mut used: HashSet<u32> = HashSet::new();
+        let mut selected: Vec<ObjectId> = Vec::new();
+        for r in ranges {
+            if r.start > total {
+                return Err(AppError::PageRange(format!(
+                    "page {} is beyond the end of a {}-page document",
+                    r.start, total
+                )));
+            }
+            for n in r.start..=r.end.min(total) {
+                let id = *pages
+                    .get(&n)
+                    .ok_or_else(|| AppError::PageRange(format!("page {n} missing from page tree")))?;
+                if used.insert(n) {
+                    selected.push(id);
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Build a fresh document containing exactly `ordered_pages` (in that
+    /// order).
+    ///
+    /// Copies every object reachable from those pages — excluding `/Parent`
+    /// references, so no unselected sibling page ever lands in the output —
+    /// rewrites each page's `/Parent` to the new root, carries the source
+    /// root's `/MediaBox`, and attaches a new catalog + trailer.
+    fn build_extracted_document(
+        src: &Document,
+        ordered_pages: &[ObjectId],
+    ) -> AppResult<Document> {
+        let mut out = Document::with_version("1.7");
+        let root_pages = out.new_object_id();
+
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut closure: Vec<ObjectId> = Vec::new();
+        for &page in ordered_pages {
+            Self::expand_closure(src, page, false, &mut seen, &mut closure);
+        }
+        let mut map: HashMap<ObjectId, ObjectId> = HashMap::new();
+        for &id in &closure {
+            map.insert(id, out.new_object_id());
+        }
+        for &id in &closure {
+            let obj = src.objects.get(&id).cloned().unwrap_or(Object::Null);
+            let copied = Self::remap_object(&obj, src, &mut map, &mut out);
+            out.objects.insert(map[&id], copied);
+        }
+        for &page in ordered_pages {
+            if let Some(Object::Dictionary(d)) = out.objects.get_mut(&map[&page]) {
+                d.set("Parent", root_pages);
+            }
+        }
+
+        // Carry the media box from the source root when present so viewers
+        // fall back to the document's own page size instead of a default.
+        let media_box = Self::root_pages_id(src)
+            .ok()
+            .and_then(|id| src.get_dictionary(id).ok())
+            .and_then(|d| d.get(b"MediaBox").ok())
+            .cloned();
+        let mut root_dict = dictionary! {
+            "Type" => "Pages",
+            "Kids" => Object::Array(ordered_pages.iter().map(|id| Object::Reference(map[id])).collect()),
+            "Count" => Object::Integer(ordered_pages.len() as i64),
+        };
+        if let Some(box_obj) = media_box {
+            root_dict.set("MediaBox", box_obj);
+        }
+        out.objects.insert(root_pages, Object::Dictionary(root_dict));
+
+        let catalog_id = out.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => root_pages,
+        });
+        out.trailer.set("Root", catalog_id);
+        Ok(out)
     }
 
     /// All object ids reachable from `start`, in traversal order.
@@ -522,13 +845,38 @@ fn escape_pdf_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('(', "\\(").replace(')', "\\)")
 }
 
+/// Windows `canonicalize` yields verbatim `\\?\...` paths. They are valid,
+/// but ugly in a JSON payload — strip the prefix for report fields.
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_workspace(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("localpdf-tui-tests-{name}-{}", std::process::id()));
+        // Thread-scoped dirs keep parallel tests from racing on the same files.
+        let current = std::thread::current();
+        // Test threads are named like `engine::tests::merge_...`; `::` is not
+        // a legal filename character on Windows, so keep just the function part.
+        let thread = current
+            .name()
+            .unwrap_or("main")
+            .rsplit("::")
+            .next()
+            .unwrap_or("main");
+        let dir = std::env::temp_dir().join(format!(
+            "localpdf-tui-tests-{name}-{thread}-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -545,6 +893,19 @@ mod tests {
             );
         }
         (engine, files)
+    }
+
+    /// A merged three-page document: page N's content contains "Sample N".
+    fn three_page_doc() -> (Engine, PathBuf) {
+        let (engine, files) = three_samples();
+        engine.merge(&files, Path::new("three.pdf")).unwrap();
+        let src = engine.root().join("three.pdf");
+        (engine, src)
+    }
+
+    fn page_contains(doc: &Document, page_id: ObjectId, needle: &[u8]) -> bool {
+        let content = doc.get_page_content(page_id);
+        content.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
@@ -601,5 +962,84 @@ mod tests {
         fs::write(&outside_file, b"%PDF-1.4\n").unwrap();
         let err = engine.resolve(&outside_file).unwrap_err();
         assert!(matches!(err, AppError::PathEscape { .. }));
+    }
+
+    #[test]
+    fn rotate_sets_page_rotate() {
+        let (engine, src) = three_page_doc();
+        let report = engine.rotate(&src, "1-3", 90, Path::new("rot.pdf")).unwrap();
+        assert_eq!(report.pages, 3);
+        let loaded = Document::load(engine.root().join("rot.pdf")).unwrap();
+        for (_n, page_id) in loaded.get_pages() {
+            let rot = loaded.get_dictionary(page_id).unwrap().get(b"Rotate").unwrap();
+            match rot {
+                Object::Integer(deg) => assert_eq!(*deg, 90),
+                other => panic!("expected /Rotate integer, got {other:?}"),
+            }
+        }
+        // bad angle is rejected before touching the file
+        let err = engine.rotate(&src, "1", 45, Path::new("bad.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::PageRange(_)));
+    }
+
+    #[test]
+    fn reorder_changes_page_order() {
+        let (engine, src) = three_page_doc();
+        let report = engine.reorder(&src, "3,1,2", Path::new("reordered.pdf")).unwrap();
+        assert_eq!(report.pages, 3);
+        let loaded = Document::load(engine.root().join("reordered.pdf")).unwrap();
+        let ids: Vec<ObjectId> = loaded.get_pages().into_values().collect();
+        assert_eq!(ids.len(), 3);
+        assert!(page_contains(&loaded, ids[0], b"Sample 3"));
+        assert!(page_contains(&loaded, ids[1], b"Sample 1"));
+        assert!(page_contains(&loaded, ids[2], b"Sample 2"));
+    }
+
+    #[test]
+    fn reorder_rejects_bad_orders() {
+        let (engine, src) = three_page_doc();
+        let err = engine.reorder(&src, "1,2", Path::new("x.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::Operation(_))); // incomplete list
+        let err = engine.reorder(&src, "2,2,1", Path::new("x.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::Operation(_))); // duplicate
+        let err = engine.reorder(&src, "4,1,2", Path::new("x.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::PageRange(_))); // out of range
+    }
+
+    #[test]
+    fn delete_pages_keeps_complement() {
+        let (engine, src) = three_page_doc();
+        let report = engine.delete_pages(&src, "2", Path::new("trimmed.pdf")).unwrap();
+        assert_eq!(report.pages, 2);
+        let loaded = Document::load(engine.root().join("trimmed.pdf")).unwrap();
+        let ids: Vec<ObjectId> = loaded.get_pages().into_values().collect();
+        assert!(page_contains(&loaded, ids[0], b"Sample 1"));
+        assert!(page_contains(&loaded, ids[1], b"Sample 3"));
+        // deleting everything is refused
+        let err = engine.delete_pages(&src, "1-3", Path::new("none.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+    }
+
+    #[test]
+    fn compress_produces_valid_doc() {
+        let (engine, src) = three_page_doc();
+        let report = engine.compress(&src, Path::new("compressed.pdf")).unwrap();
+        assert_eq!(report.pages, 3);
+        let loaded = Document::load(engine.root().join("compressed.pdf")).unwrap();
+        assert_eq!(loaded.get_pages().len(), 3);
+        let ids: Vec<ObjectId> = loaded.get_pages().into_values().collect();
+        assert!(page_contains(&loaded, ids[2], b"Sample 3"));
+    }
+
+    #[test]
+    fn info_reports_metadata() {
+        let (engine, files) = three_samples();
+        let r = engine.info(&files[0]).unwrap();
+        assert_eq!(r.pages, 1);
+        assert!(!r.encrypted);
+        assert!(r.object_count > 3);
+        assert_eq!(r.title.as_deref(), Some("Sample 1"));
+        assert_eq!(r.creator.as_deref(), Some("LocalPDF-TUI"));
+        assert!(r.file_size_bytes > 0);
     }
 }

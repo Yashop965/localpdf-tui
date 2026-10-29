@@ -38,11 +38,39 @@ struct Cli {
     #[arg(long)]
     split: Option<PathBuf>,
 
-    /// 1-based page ranges, e.g. `1-3,5` (agent mode, requires --split).
+    /// Source document for rotate (agent mode; needs --pages and --degrees).
+    #[arg(long)]
+    rotate: Option<PathBuf>,
+
+    /// Rotation angle: 90, 180, or 270 (agent mode, with --rotate).
+    #[arg(long)]
+    degrees: Option<u32>,
+
+    /// Source document for reorder (agent mode; needs --order).
+    #[arg(long)]
+    reorder: Option<PathBuf>,
+
+    /// New page order: every page number exactly once, e.g. `3,1,2` (with --reorder).
+    #[arg(long)]
+    order: Option<String>,
+
+    /// Source document for delete-pages (agent mode; needs --pages).
+    #[arg(long)]
+    delete_pages: Option<PathBuf>,
+
+    /// Source document for compress (agent mode).
+    #[arg(long)]
+    compress: Option<PathBuf>,
+
+    /// Source document for info (agent mode; read-only report).
+    #[arg(long)]
+    info: Option<PathBuf>,
+
+    /// 1-based page ranges, e.g. `1-3,5` (agent mode, with --split / --rotate / --delete-pages).
     #[arg(long)]
     pages: Option<String>,
 
-    /// Output path (agent mode; defaults to merged.pdf / split.pdf in the workspace).
+    /// Output path (agent mode; per-operation defaults live in the workspace).
     #[arg(long)]
     output: Option<PathBuf>,
 
@@ -79,31 +107,94 @@ fn main() {
     }
 }
 
+/// Agent-mode result shapes: write operations report a file, `info` reports
+/// document facts. Both serialize to a single stable JSON document.
+enum AgentOutcome {
+    Op(engine::OperationReport),
+    Info(engine::InfoReport),
+}
+
 /// Agent mode: one operation, one JSON document on stdout, status as exit code.
 fn run_agent(cli: &Cli, engine: &Engine) -> i32 {
-    let outcome: (&str, Result<engine::OperationReport, AppError>) = if !cli.merge.is_empty() {
-        let output = cli.output.clone().unwrap_or_else(|| PathBuf::from("merged.pdf"));
-        ("merge", engine.merge(&cli.merge, &output))
+    let outcome: (&str, Result<AgentOutcome, AppError>) = if !cli.merge.is_empty() {
+        let output = default_output(cli, "merged.pdf");
+        ("merge", engine.merge(&cli.merge, &output).map(AgentOutcome::Op))
+    } else if let Some(source) = &cli.rotate {
+        let output = default_output(cli, "rotated.pdf");
+        match (&cli.pages, cli.degrees) {
+            (Some(spec), Some(degrees)) => {
+                ("rotate", engine.rotate(source, spec, degrees, &output).map(AgentOutcome::Op))
+            }
+            _ => (
+                "rotate",
+                Err(AppError::Operation(
+                    "--rotate requires --pages <ranges> and --degrees 90|180|270".into(),
+                )),
+            ),
+        }
+    } else if let Some(source) = &cli.reorder {
+        let output = default_output(cli, "reordered.pdf");
+        match &cli.order {
+            Some(order) => ("reorder", engine.reorder(source, order, &output).map(AgentOutcome::Op)),
+            None => (
+                "reorder",
+                Err(AppError::Operation("--reorder requires --order <list, e.g. 3,1,2>".into())),
+            ),
+        }
+    } else if let Some(source) = &cli.delete_pages {
+        let output = default_output(cli, "trimmed.pdf");
+        match &cli.pages {
+            Some(spec) => {
+                ("delete", engine.delete_pages(source, spec, &output).map(AgentOutcome::Op))
+            }
+            None => (
+                "delete",
+                Err(AppError::Operation("--delete-pages requires --pages <ranges>".into())),
+            ),
+        }
+    } else if let Some(source) = &cli.compress {
+        let output = default_output(cli, "compressed.pdf");
+        ("compress", engine.compress(source, &output).map(AgentOutcome::Op))
+    } else if let Some(source) = &cli.info {
+        ("info", engine.info(source).map(AgentOutcome::Info))
     } else if let (Some(source), Some(spec)) = (&cli.split, &cli.pages) {
-        let output = cli.output.clone().unwrap_or_else(|| PathBuf::from("split.pdf"));
-        ("split", split_with_spec(engine, source, spec, &output))
+        let output = default_output(cli, "split.pdf");
+        ("split", split_with_spec(engine, source, spec, &output).map(AgentOutcome::Op))
     } else if cli.split.is_some() {
         return agent_error("split", "--pages is required with --split");
     } else {
         return agent_error(
             "agent",
-            "--json requires `--merge <files…> [--output out.pdf]` or `--split <file> --pages <ranges> [--output out.pdf]`",
+            "--json requires one of: --merge <files…> | --split <file> --pages <ranges> | \
+             --rotate <file> --pages <ranges> --degrees 90|180|270 | --reorder <file> --order 3,1,2 \
+             | --delete-pages <file> --pages <ranges> | --compress <file> | --info <file> \
+             (all may take --output <path> and --workspace <dir>)",
         );
     };
 
     let (operation, result) = outcome;
     match result {
-        Ok(report) => {
-            println!("{}", to_json_success(&report));
+        Ok(AgentOutcome::Op(report)) => {
+            println!("{}", to_json(&report));
             0
+        }
+        Ok(AgentOutcome::Info(report)) => {
+            match serde_json::to_string(&report) {
+                Ok(doc) => {
+                    println!("{doc}");
+                    0
+                }
+                Err(_) => agent_error("info", "json serialization failed"),
+            }
         }
         Err(e) => agent_error(operation, &e.to_string()),
     }
+}
+
+fn default_output(cli: &Cli, fallback: &str) -> std::path::PathBuf {
+    cli.output
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(fallback))
 }
 
 fn split_with_spec(
@@ -116,8 +207,8 @@ fn split_with_spec(
     engine.split(source, &ranges, output)
 }
 
-/// Stable field order: status, operation, output_file, pages.
-fn to_json_success(report: &engine::OperationReport) -> String {
+/// Stable field order: status first, then operation-specific fields.
+fn to_json(report: &engine::OperationReport) -> String {
     serde_json::to_string(report).unwrap_or_else(|_| {
         r#"{"status":"error","operation":"unknown","error":"json serialization failed"}"#.to_string()
     })

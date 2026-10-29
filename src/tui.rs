@@ -18,12 +18,20 @@ use crate::error::{AppError, AppResult};
 use crate::ui;
 
 /// Which operations the dashboard offers, in display order.
-pub const OPS: &[&str] = &["Merge", "Split", "Compress"];
+pub const OPS: &[&str] = &["Merge", "Split", "Compress", "Rotate", "Delete", "Info"];
 pub const OPS_DESC: &[&str] = &[
     "concatenate the whole file queue into one document",
     "extract page ranges from the highlighted queue file",
-    "reduce file size — planned for v0.2",
+    "rebuild + flate-compress the highlighted file",
+    "set /Rotate on pages — input `ranges:degrees`, e.g. 1,3:90",
+    "remove page ranges from the highlighted file",
+    "report pages, size, encryption and metadata",
 ];
+
+/// Operations whose context input line is a page range spec.
+pub const HAS_RANGE_INPUT: &[usize] = &[1, 4]; // Split, Delete
+/// The rotate op takes `ranges:degrees` in the input line.
+pub const ROTATE_INPUT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -54,7 +62,7 @@ pub struct App {
     pub q_index: usize,
     pub ops_index: usize,
     pub focus: Panel,
-    pub split_spec: String,
+    pub ctx_input: String,
     pub log: VecDeque<String>,
     sample_counter: u32,
     should_quit: bool,
@@ -69,7 +77,7 @@ impl App {
             q_index: 0,
             ops_index: 0,
             focus: Panel::Queue,
-            split_spec: String::new(),
+            ctx_input: String::new(),
             log: VecDeque::new(),
             sample_counter: 0,
             should_quit: false,
@@ -128,6 +136,36 @@ impl App {
         }
     }
 
+    /// The highlighted queue file (bounds-checked) — the source for every
+    /// single-file operation.
+    fn active_source(&self) -> Option<&PathBuf> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let idx = self.q_index.min(self.queue.len() - 1);
+        Some(&self.queue[idx].path)
+    }
+
+    /// Parse the rotate input line `ranges:degrees` (degrees optional,
+    /// defaults to 90).
+    fn parse_rotate_input(&self) -> Result<(String, u32), String> {
+        let spec = self.ctx_input.trim();
+        if spec.is_empty() {
+            return Err("type a page range for rotate, e.g. 1,3:90".into());
+        }
+        let (range_part, deg_part) = match spec.split_once(':') {
+            Some((r, d)) => (r.trim(), d.trim()),
+            None => (spec, "90"),
+        };
+        if range_part.is_empty() {
+            return Err("missing page range before ':'".into());
+        }
+        let degrees = deg_part
+            .parse::<u32>()
+            .map_err(|_| format!("'{}' is not a number (use 90, 180, 270)", deg_part))?;
+        Ok((range_part.to_string(), degrees))
+    }
+
     fn run_selected_op(&mut self) {
         match OPS[self.ops_index] {
             "Merge" => {
@@ -146,13 +184,14 @@ impl App {
                 }
             }
             "Split" => {
-                if self.queue.is_empty() {
-                    self.set_log(StatusKind::Error, "no file to split — press [a] to queue one first");
-                    return;
-                }
-                let idx = self.q_index.min(self.queue.len() - 1);
-                let source = self.queue[idx].path.clone();
-                let spec = self.split_spec.trim();
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let spec = self.ctx_input.trim();
                 if spec.is_empty() {
                     self.set_log(StatusKind::Error, "type a page range for split, e.g. 1-3,5");
                     return;
@@ -172,7 +211,88 @@ impl App {
                     Err(e) => self.set_log(StatusKind::Error, &format!("split failed: {e}")),
                 }
             }
-            _ => self.set_log(StatusKind::Error, "compress is not in the v0.1 engine yet"),
+            "Compress" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                match self.engine.compress(&source, Path::new("compressed.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("compressed → {} ({} pages)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("compress failed: {e}")),
+                }
+            }
+            "Rotate" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let (spec, degrees) = match self.parse_rotate_input() {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        self.set_log(StatusKind::Error, &msg);
+                        return;
+                    }
+                };
+                match self.engine.rotate(&source, &spec, degrees, Path::new("rotated.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("rotated '{spec}' by {degrees}° → {} ({} pages)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("rotate failed: {e}")),
+                }
+            }
+            "Delete" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let spec = self.ctx_input.trim();
+                if spec.is_empty() {
+                    self.set_log(StatusKind::Error, "type the page ranges to delete, e.g. 2,4-5");
+                    return;
+                }
+                match self.engine.delete_pages(&source, spec, Path::new("trimmed.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("deleted '{spec}' → {} ({} pages kept)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("delete failed: {e}")),
+                }
+            }
+            "Info" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                match self.engine.info(&source) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!(
+                            "{}: {} pages · {} KB · {} · '{}'",
+                            r.source_file, r.pages, r.file_size_bytes / 1024,
+                            if r.encrypted { "encrypted" } else { "plain" },
+                            r.title.clone().unwrap_or_default()
+                        ),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("info failed: {e}")),
+                }
+            }
+            _ => unreachable!("OPS must match OPS_DESC"),
         }
     }
 
@@ -209,6 +329,23 @@ impl App {
         }
     }
 
+    /// Whether the currently selected operation has a context input line.
+    fn op_takes_input(&self) -> bool {
+        HAS_RANGE_INPUT.contains(&self.ops_index) || self.ops_index == ROTATE_INPUT
+    }
+
+    /// Whether `c` is a valid context-input character for the current op.
+    fn op_accepts(&self, c: char) -> bool {
+        if !self.op_takes_input() || self.ctx_input.len() >= 24 {
+            return false;
+        }
+        if self.ops_index == ROTATE_INPUT {
+            c.is_ascii_digit() || c == ',' || c == '-' || (c == ':' && !self.ctx_input.contains(':'))
+        } else {
+            c.is_ascii_digit() || c == ',' || c == '-'
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         let plain = key.modifiers == KeyModifiers::NONE;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -222,11 +359,11 @@ impl App {
             KeyCode::Left | KeyCode::BackTab => self.switch_focus(Panel::Queue),
             KeyCode::Right | KeyCode::Tab => self.switch_focus(Panel::Ops),
             KeyCode::Enter if self.focus == Panel::Ops => self.run_selected_op(),
-            KeyCode::Backspace if self.focus == Panel::Ops => {
-                self.split_spec.pop();
+            KeyCode::Backspace if self.focus == Panel::Ops && self.op_takes_input() => {
+                self.ctx_input.pop();
             }
-            KeyCode::Char(c) if self.focus == Panel::Ops && "0123456789,-".contains(c) && self.split_spec.len() < 24 => {
-                self.split_spec.push(c);
+            KeyCode::Char(c) if self.focus == Panel::Ops && self.op_accepts(c) => {
+                self.ctx_input.push(c);
             }
             _ => {}
         }

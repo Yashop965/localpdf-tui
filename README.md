@@ -7,12 +7,17 @@ fast Rust binary, with two frontends over the same engine:
 - a polished **TUI dashboard** for humans,
 - a deterministic **JSON CLI** for AI agents.
 
-## Features (v0.1)
+## Features (v0.2)
 
 | Operation | TUI | Agent mode |
 |---|---|---|
 | Merge PDFs | ✓ | `--json --merge a.pdf b.pdf` |
 | Split page ranges | ✓ | `--json --split in.pdf --pages 1-3,5` |
+| Compress (orphan drop + Flate) | ✓ | `--json --compress in.pdf` |
+| Rotate pages | ✓ | `--json --rotate in.pdf --pages 1,3-5 --degrees 90` |
+| Reorder pages | ✓ | `--json --reorder in.pdf --order 3,1,2` |
+| Delete pages | ✓ | `--json --delete-pages in.pdf --pages 2,4-5` |
+| Document info | ✓ | `--json --info in.pdf` |
 | Generate sample PDF | `[a]` key | `engine::generate_sample` (used by tests/demo) |
 
 See [`PRD.md`](./PRD.md) for the full feature roadmap (compress, rotate,
@@ -44,6 +49,14 @@ localpdf-tui --json --merge a.pdf b.pdf c.pdf --output merged.pdf
 # split pages 1-3 and 5
 localpdf-tui --json --split big.pdf --pages 1-3,5 --output part.pdf
 # → {"status":"success","operation":"split","output_file":"...\\part.pdf","pages":4}
+
+# rotate page 2 by 90°
+localpdf-tui --json --rotate big.pdf --pages 2 --degrees 90
+# → {"status":"success","operation":"rotate","output_file":"...\\rotated.pdf","pages":1}
+
+# document facts, no file written
+localpdf-tui --json --info big.pdf
+# → {"status":"success","operation":"info","source_file":"...","pages":42,"file_size_bytes":183221,"object_count":310,"encrypted":false,"title":"Q3 Report","creator":"…"}
 
 # on failure the only shape is:
 # → {"status":"error","operation":"split","error":"page 4 is beyond the end of a 3-page document"}
