@@ -219,7 +219,7 @@ impl App {
                         return;
                     }
                 };
-                match self.engine.compress(&source, Path::new("compressed.pdf")) {
+                match self.engine.compress(&source, Path::new("compressed.pdf"), 9) {
                     Ok(r) => self.set_log(
                         StatusKind::Ok,
                         &format!("compressed → {} ({} pages)", r.output_file, r.pages),

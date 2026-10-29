@@ -63,10 +63,10 @@ Rules for M1+:
 
 ## 5. Feature roadmap ("the things we actually use locally")
 
-### P0 — v0.2 (M1, next class) — **shipped 2026-10-28**
+### P0 — v0.2 (M1) — **shipped 2026-10-28**
 | Op | CLI flag | Notes |
 |---|---|---|
-| Compress | `--json --compress in.pdf` | drop orphaned objects (closure-copy keep-only-reachable) + Flate-compress unfiltered streams. (`--level` deferred — `lopdf::Stream::compress` pins level 9; revisit when we control the encoder) |
+| Compress | `--json --compress in.pdf [--level 0-9]` | drop orphaned objects (closure-copy keep-only-reachable) + Flate-compress unfiltered streams at the requested level (0-9, default 9). `--level` implemented directly with `flate2::Compression` when M2 landed. |
 | Rotate | `--json --rotate in.pdf --pages 1,3-5 --degrees 90\|180\|270` | set `/Rotate` on selected page dicts |
 | Reorder | `--json --reorder in.pdf --order 3,1,2` | rewrite root Kids array |
 | Delete pages | `--json --delete-pages in.pdf --pages 2,4-5` | split's inverse: keep-complement, same minimal-copy path |
@@ -75,16 +75,16 @@ Rules for M1+:
 TUI: right column grows to **Merge · Split · Compress · Rotate · Delete · Info**;
 context input line under it changes shape per op (range / degrees / order / text).
 
-### P1 — v0.3 (M2)
+### P1 — v0.3 (M2) — **shipped 2026-10-30**
 | Op | CLI flag | Notes |
 |---|---|---|
-| Extract text | `--json --extract-text in.pdf [--pages 1-3] [--out text.md]` | lopdf `extract_text`; print to stdout when agent mode + no `--out` |
-| Extract images | `--json --extract-images in.pdf --out-dir img/` | walk `/XObject` image streams, write PNG/JPEG, JSON list of files |
-| Watermark | `--json --watermark in.pdf --text "CONFIDENTIAL" [--opacity 0.3]` | overlay content stream per page |
-| Page numbers | `--json --page-numbers in.pdf [--pos bottom-center]` | same overlay machinery |
-| Metadata edit | `--json --metadata in.pdf --set "Title=x" --set "Author=y"` | rewrite trailer Info dict |
-| PDF → images | `--json --to-png in.pdf --out-dir img/` | render via embedded rasterizer (pikepdf-free: use `pdf_oxide`? — decide: default to lopdf + a small raster pass, document limits: vector text needs a rasterizer, so this is flagged "best-effort" unless we pull a render dep) |
-| Images → PDF | `--json --from-images a.png b.jpg` | one image per page, standard MediaBox scaling |
+| Extract text | `--json --extract-text in.pdf [--pages 1-3] [--output text.md]` | lopdf `extract_text_with_limit` (32 MiB bomb cap); text is embedded in the JSON when no output file is given |
+| Extract images | `--json --extract-images in.pdf [--out-dir img/]` | walk page `/XObject` tables; JPEG pass-through, Flate-decoded 8-bit gray/RGB → PNG (64 MiB cap); CMYK/indexed/16-bit/JPX/JBIG2 counted as skipped |
+| Watermark | `--json --watermark in.pdf --text "CONFIDENTIAL"` | one shared diagonal Form overlay appended to every page's `/Contents` array; text 1-120 chars (`--opacity` parked — gray 50% for now) |
+| Page numbers | `--json --pagenum in.pdf` | per-page overlay (numbered stamp appended to that page only), bottom-center-ish fixed position |
+| Metadata edit | `--json --set-metadata in.pdf --meta "Title=x" [--meta …]` | repeatable `Key=Value` pairs; Info dict created if absent |
+| Images → PDF | `--json --from-images a.png b.jpg [--out f]` | one page per image via `lopdf::xobject::image_from` (JPEG DCT pass-through, others re-encoded raw); MediaBox = pixel size |
+| PDF → images (render) | `--json --to-png in.pdf` | **parked to M3** — needs a rasterizer (pdfium/magick interop); lopdf can't render. The *object* direction (extract embedded image streams) ships now via extract-images |
 
 ### P2 — later (M3+)
 - **Encrypt / decrypt** (`--password`; lopdf encryption support is present in 0.46)
@@ -165,8 +165,11 @@ order (`3,1,2`), text. Invalid input never executes; it flashes in the log.
 - **M0 — done:** skeleton, merge, split, agent JSON, sandbox, samples, 5 tests.
 - **M1 — done (2026-10-28):** compress, rotate, reorder, delete-pages, info +
   TUI wiring (6-op dashboard, per-op context input) + 11 tests + CLI smoke.
-- **M2 (v0.3):** text/image extraction, watermark, page numbers, metadata, image↔PDF.
-- **M3:** encryption, repair, watch/batch, config, release packaging.
+- **M2 — done (2026-10-30):** extract-text (bounded), extract-images
+  (JPEG pass-through + Flate→PNG), images→PDF (`from_images`), watermark,
+  page numbers, metadata, compress `--level 0-9` + 17 tests + CLI smoke.
+- **M3:** to-png rasterization (pdfium/magick interop), encryption, repair,
+  watch/batch, config, release packaging.
 
 ## 11. Class demo script (2 minutes)
 

@@ -50,6 +50,33 @@ pub struct InfoReport {
     pub creator: Option<String>,
 }
 
+/// Report for `--extract-text`: the decoded text plus where it went
+/// (embedded in the JSON when no output file was requested).
+#[derive(Debug, Serialize)]
+pub struct ExtractTextReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub source_file: String,
+    pub pages: u32,
+    pub characters: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Report for `--extract-images`: what was pulled out of the XObject table.
+#[derive(Debug, Serialize)]
+pub struct ExtractImagesReport {
+    pub status: &'static str,
+    pub operation: &'static str,
+    pub source_file: String,
+    pub found: u32,
+    pub files: Vec<String>,
+    pub skipped: u32,
+    pub output_dir: String,
+}
+
 /// Inclusive 1-based page range: `start..=end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -91,6 +118,25 @@ pub fn parse_ranges(spec: &str) -> AppResult<Vec<Range>> {
     }
     Ok(out)
 }
+
+/// Result of trying to pull usable pixel data out of an image XObject.
+enum ImagePayload {
+    /// DCT-encoded (JPEG) — can be written to disk untouched.
+    Jpeg(Vec<u8>),
+    /// 8-bit raw pixels, decoded and ready for PNG re-encoding.
+    Pixels {
+        width: u32,
+        height: u32,
+        rgb: bool,
+        bytes: Vec<u8>,
+    },
+    /// Something we refuse to guess at (CMYK, indexed, 16-bit, JPX...).
+    Unsupported,
+}
+
+/// A decompression bomb in an image stream must not be able to exhaust
+/// memory: cap the expanded pixel data.
+const MAX_IMAGE_STREAM: usize = 64 * 1024 * 1024;
 
 /// Sandboxed engine: every file access is pinned under `root`.
 #[derive(Debug, Clone)]
@@ -440,8 +486,21 @@ impl Engine {
 
     /// Compress: keep only objects reachable from the catalog (orphaned
     /// objects from incremental updates are dropped) and Flate-compress
-    /// every unfiltered stream that gets smaller.
-    pub fn compress(&self, input: &Path, output: &Path) -> AppResult<OperationReport> {
+    /// every unfiltered stream that gets smaller, at the given level 0-9.
+    pub fn compress(
+        &self,
+        input: &Path,
+        output: &Path,
+        level: u32,
+    ) -> AppResult<OperationReport> {
+        match level {
+            0..=9 => {}
+            _ => {
+                return Err(AppError::Operation(format!(
+                    "--level must be 0-9 (got {level})"
+                )));
+            }
+        }
         let src = self.load_pdf(input)?;
         let root_ref = src
             .trailer
@@ -489,10 +548,14 @@ impl Engine {
 
         for value in out.objects.values_mut() {
             if let Object::Stream(stream) = value {
-                // Skip streams that are already filtered; `compress` only
-                // shrinks when the result is actually smaller.
+                // Skip streams that are already filtered; compression is
+                // applied only when the result is actually smaller.
                 if stream.dict.get(b"Filter").is_err() {
-                    let _ = stream.compress();
+                    let compressed = zlib_compress_level(&stream.content, level)?;
+                    if compressed.len() + 19 < stream.content.len() {
+                        stream.dict.set("Filter", "FlateDecode");
+                        stream.set_content(compressed);
+                    }
                 }
             }
         }
@@ -551,6 +614,500 @@ impl Engine {
             _ => return None,
         };
         Some(String::from_utf8_lossy(s).into_owned())
+    }
+
+    /// Decode the text layer of the given pages (`page_spec = None` means all
+    /// of them). With an `out` path the text is written there; otherwise it is
+    /// returned in the report so the caller can embed it.
+    pub fn extract_text(
+        &self,
+        input: &Path,
+        page_spec: Option<&str>,
+        out: Option<&Path>,
+    ) -> AppResult<ExtractTextReport> {
+        let resolved = self.resolve(input)?;
+        let doc = self.load_pdf(&resolved)?;
+        let total = u32::try_from(doc.get_pages().len()).unwrap_or(0);
+        if total == 0 {
+            return Err(AppError::Operation("document contains no pages".into()));
+        }
+
+        let nums: Vec<u32> = match page_spec {
+            None => (1..=total).collect(),
+            Some(spec) => {
+                let ranges = parse_ranges(spec)?;
+                let mut nums = Vec::new();
+                for r in &ranges {
+                    if r.start > total {
+                        return Err(AppError::PageRange(format!(
+                            "page {} is beyond the end of a {}-page document",
+                            r.start, total
+                        )));
+                    }
+                    nums.extend(r.start..=r.end.min(total));
+                }
+                nums
+            }
+        };
+
+        // Bounded so a decompression-bomb content stream can't exhaust memory.
+        const MAX_TEXT_BYTES: usize = 32 * 1024 * 1024;
+        let text = doc
+            .extract_text_with_limit(&nums, MAX_TEXT_BYTES)
+            .map_err(|e| AppError::Operation(e.to_string()))?;
+
+        let output_file = match out {
+            Some(dest) => {
+                let path = self.resolve_destination(dest)?;
+                std::fs::write(&path, text.as_bytes())
+                    .map_err(|e| AppError::Io("write text".to_string(), e))?;
+                Some(display_path(&path))
+            }
+            None => None,
+        };
+        // Embed the text in the JSON only when it went nowhere else.
+        let embed_text = output_file.is_none();
+
+        Ok(ExtractTextReport {
+            status: "success",
+            operation: "extract-text",
+            source_file: display_path(&resolved),
+            pages: nums.len() as u32,
+            characters: text.chars().count() as u32,
+            output_file,
+            text: embed_text.then_some(text),
+        })
+    }
+
+    /// Pull raster images out of the document's XObject table into
+    /// `out_dir` (created if missing). JPEG streams are copied through
+    /// untouched; raw/Flate-decoded pixel data is re-encoded as PNG.
+    /// Unsupported encodings (CMYK, indexed, 16-bit) count as skipped.
+    pub fn extract_images(
+        &self,
+        input: &Path,
+        out_dir: &Path,
+    ) -> AppResult<ExtractImagesReport> {
+        let resolved = self.resolve(input)?;
+        let doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+        let dir = self.resolve_destination(out_dir)?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Io("create output dir".to_string(), e))?;
+
+        // Page number -> (resource name -> xobject id), so output files can be
+        // named after the page that carries the image.
+        let mut located: BTreeMap<ObjectId, (u32, String)> = BTreeMap::new();
+        for (page_num, page_id) in doc.get_pages() {
+            let page = match doc.objects.get(&page_id) {
+                Some(Object::Dictionary(d)) => d,
+                _ => continue,
+            };
+            let xobjs = Self::page_xobject_table(&doc, page);
+            for (name, id) in xobjs {
+                located.entry(id).or_insert_with(|| (page_num, name));
+            }
+        }
+
+        let mut files: Vec<String> = Vec::new();
+        let mut skipped: u32 = 0;
+        for (id, obj) in doc.objects.iter() {
+            let stream = match obj {
+                Object::Stream(s) if Self::stream_is_image(s) => s,
+                _ => continue,
+            };
+            let (page_num, name) = located
+                .get(id)
+                .cloned()
+                .unwrap_or((0, String::from("x")));
+            match Self::decode_image_stream(stream, &name) {
+                ImagePayload::Jpeg(bytes) => {
+                    let file_name = format!("page{page_num}-{name}.jpg");
+                    std::fs::write(dir.join(&file_name), &bytes)
+                        .map_err(|e| AppError::Io("write image".to_string(), e))?;
+                    files.push(file_name);
+                }
+                ImagePayload::Pixels {
+                    width,
+                    height,
+                    rgb,
+                    bytes,
+                } => {
+                    let file_name = format!("page{page_num}-{name}.png");
+                    let img = if rgb {
+                        let pixels = image::RgbImage::from_raw(width, height, bytes)
+                            .ok_or_else(|| AppError::Operation("bad RGB pixel data".into()))?;
+                        image::DynamicImage::ImageRgb8(pixels)
+                    } else {
+                        let pixels = image::GrayImage::from_raw(width, height, bytes)
+                            .ok_or_else(|| AppError::Operation("bad gray pixel data".into()))?;
+                        image::DynamicImage::ImageLuma8(pixels)
+                    };
+                    img.save(dir.join(&file_name))
+                        .map_err(|e| AppError::Operation(format!("png encode: {e}")))?;
+                    files.push(file_name);
+                }
+                ImagePayload::Unsupported => skipped += 1,
+            }
+        }
+
+        Ok(ExtractImagesReport {
+            status: "success",
+            operation: "extract-images",
+            source_file: display_path(&resolved),
+            found: files.len() as u32 + skipped,
+            files,
+            skipped,
+            output_dir: display_path(&dir),
+        })
+    }
+
+    /// `true` when the stream is an image XObject.
+    fn stream_is_image(stream: &Stream) -> bool {
+        stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            == Some(b"Image")
+    }
+
+    fn decode_image_stream(stream: &Stream, _name: &str) -> ImagePayload {
+        let dict = &stream.dict;
+        let filter = dict.get(b"Filter").ok().and_then(|o| o.as_name().ok());
+        let raw = match filter {
+            Some(b"DCTDecode") => return ImagePayload::Jpeg(stream.content.clone()),
+            Some(b"JPXDecode") | Some(b"JBIG2Decode") => return ImagePayload::Unsupported,
+            Some(b"FlateDecode") => {
+                let mut out = Vec::new();
+                let mut decoder = flate2::read::ZlibDecoder::new(stream.content.as_slice());
+                let mut buf = [0u8; 32 * 1024];
+                loop {
+                    match std::io::Read::read(&mut decoder, &mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            out.extend_from_slice(&buf[..n]);
+                            if out.len() > MAX_IMAGE_STREAM {
+                                return ImagePayload::Unsupported;
+                            }
+                        }
+                        Err(_) => return ImagePayload::Unsupported,
+                    }
+                }
+                out
+            }
+            Some(_) => return ImagePayload::Unsupported,
+            None => stream.content.clone(),
+        };
+
+        let channels = match dict.get(b"ColorSpace").ok().and_then(|o| o.as_name().ok()) {
+            Some(b"DeviceGray") => 1,
+            Some(b"DeviceRGB") => 3,
+            _ => return ImagePayload::Unsupported,
+        };
+        let width = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok());
+        let height = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok());
+        let bpc = dict
+            .get(b"BitsPerComponent")
+            .ok()
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(8);
+        let (w, h) = match (width, height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 && bpc == 8 => (w as u32, h as u32),
+            _ => return ImagePayload::Unsupported,
+        };
+        let expected = w as usize * h as usize * channels as usize;
+        if raw.len() < expected {
+            return ImagePayload::Unsupported;
+        }
+        let bytes = raw[..expected].to_vec();
+        ImagePayload::Pixels {
+            width: w,
+            height: h,
+            rgb: channels == 3,
+            bytes,
+        }
+    }
+
+    /// Resolve a page's `/Resources << /XObject ... >>` table into
+    /// `(resource name, object id)` pairs, following references.
+    fn page_xobject_table(doc: &Document, page: &Dictionary) -> Vec<(String, ObjectId)> {
+        let resources = match page.get(b"Resources").ok().and_then(|o| match o {
+            Object::Reference(id) => doc.objects.get(&id).cloned(),
+            other => Some(other.clone()),
+        }) {
+            Some(Object::Dictionary(d)) => d,
+            _ => return Vec::new(),
+        };
+        let xobjects = match resources.get(b"XObject").ok().and_then(|o| match o {
+            Object::Reference(id) => doc.objects.get(&id).cloned(),
+            other => Some(other.clone()),
+        }) {
+            Some(Object::Dictionary(d)) => d,
+            _ => return Vec::new(),
+        };
+        xobjects
+            .iter()
+            .filter_map(|(k, v)| {
+                let id = match v {
+                    Object::Reference(id) => *id,
+                    _ => return None,
+                };
+                Some((String::from_utf8_lossy(k).into_owned(), id))
+            })
+            .collect()
+    }
+
+    /// Lay a centered, diagonal, semi-transparent text watermark on every
+    /// page. One shared content stream is appended to each page's
+    /// `/Contents`, so the source pages' content is preserved byte-for-byte.
+    pub fn watermark(&self, input: &Path, text: &str, output: &Path) -> AppResult<OperationReport> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > 120 {
+            return Err(AppError::Operation(
+                "watermark text must be 1-120 characters".into(),
+            ));
+        }
+        let resolved = self.resolve(input)?;
+        let mut doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+
+        let font = Self::font_object();
+        let font_id = doc.add_object(Object::Dictionary(font));
+        let overlay = Self::overlay_stream(&font_id, &format!(
+            "q 0.35355 0.35355 -0.35355 0.35355 120 320 cm 0.5 g /F1 48 Tf ({}) Tj Q",
+            escape_pdf_string(text)
+        ));
+        let overlay_id = doc.add_object(Object::Stream(overlay));
+        Self::append_contents(&mut doc, overlay_id)?;
+
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "watermark",
+            output_file: display_path(&written),
+            pages: doc.get_pages().len() as u32,
+        })
+    }
+
+    /// Print the 1-based page number, centered in the bottom margin, of every
+    /// page. Uses the same shared-overlay mechanism as [`Self::watermark`].
+    pub fn page_numbers(&self, input: &Path, output: &Path) -> AppResult<OperationReport> {
+        let resolved = self.resolve(input)?;
+        let mut doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+
+        let font = Self::font_object();
+        let font_id = doc.add_object(Object::Dictionary(font));
+        // One overlay per page, each appended only to its own page (the
+        // shared-overlay `append_contents` helper would stamp every page).
+        let page_list: Vec<(u32, ObjectId)> = doc.get_pages().into_iter().collect();
+        let overlays: Vec<ObjectId> = page_list
+            .iter()
+            .map(|(page_num, _)| {
+                doc.add_object(Object::Stream(Self::overlay_stream(
+                    &font_id,
+                    &format!("q 0.2 g /F1 10 Tf 260 20 Td ({page_num}) Tj Q"),
+                )))
+            })
+            .collect();
+        for ((_num, page_id), overlay_id) in page_list.iter().zip(overlays.iter()) {
+            Self::append_content_to_page(&mut doc, *page_id, *overlay_id)?;
+        }
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "page-numbers",
+            output_file: display_path(&written),
+            pages: doc.get_pages().len() as u32,
+        })
+    }
+
+    /// Set arbitrary `Key=Value` pairs on the document's Info dictionary.
+    /// The dict is created if the document has none.
+    pub fn set_metadata(
+        &self,
+        input: &Path,
+        pairs: &[(String, String)],
+        output: &Path,
+    ) -> AppResult<OperationReport> {
+        if pairs.is_empty() {
+            return Err(AppError::Operation("no metadata pairs supplied".into()));
+        }
+        let resolved = self.resolve(input)?;
+        let mut doc = Document::load(&resolved).map_err(|e| AppError::Pdf(e.to_string()))?;
+
+        let apply = |d: &mut Dictionary| {
+            for (k, v) in pairs {
+                d.set(k.as_str(), Object::string_literal(v.as_bytes()));
+            }
+        };
+        match doc.trailer.get(b"Info").ok() {
+            Some(Object::Reference(id)) => {
+                let dict = doc
+                    .get_dictionary_mut(*id)
+                    .map_err(|e| AppError::Pdf(e.to_string()))?;
+                apply(dict);
+            }
+            _ => {
+                let mut dict = Dictionary::new();
+                apply(&mut dict);
+                let info_id = doc.add_object(Object::Dictionary(dict));
+                doc.trailer.set("Info", Object::Reference(info_id));
+            }
+        }
+
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "metadata",
+            output_file: display_path(&written),
+            pages: doc.get_pages().len() as u32,
+        })
+    }
+
+    /// Assemble a new document from raster images — one page per image,
+    /// sized to the image's pixel dimensions. JPEGs are embedded with
+    /// `DCTDecode` (no re-encode); everything else is decoded via the
+    /// `image` crate and stored as raw pixels.
+    pub fn from_images(&self, inputs: &[&Path], output: &Path) -> AppResult<OperationReport> {
+        if inputs.is_empty() {
+            return Err(AppError::Operation("no images supplied".into()));
+        }
+        let mut doc = Document::new();
+        let mut kids: Vec<Object> = Vec::new();
+        let mut page_ids: Vec<ObjectId> = Vec::new();
+
+        for image_path in inputs {
+            let resolved = self.resolve(image_path)?;
+            let bytes = std::fs::read(&resolved)
+                .map_err(|e| AppError::Io("read image".to_string(), e))?;
+            let image_stream = lopdf::xobject::image_from(bytes)
+                .map_err(|e| AppError::Operation(format!("cannot embed {resolved:?}: {e}")))?;
+            let image_id = doc.add_object(Object::Stream(image_stream));
+            let stream_dict = match &doc.objects[&image_id] {
+                Object::Stream(s) => &s.dict,
+                _ => return Err(AppError::Operation("embedded image stream missing".into())),
+            };
+            let width = stream_dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1);
+            let height = stream_dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1);
+
+            let resources = Self::xobject_resources(&image_id);
+            let resources_id = doc.add_object(Object::Dictionary(resources));
+            let content =
+                format!("q {width} 0 0 {height} 0 0 cm /Im0 Do Q").into_bytes();
+            let content_id = doc.add_object(Object::Stream(Stream::new(Dictionary::new(), content)));
+
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set(
+                "MediaBox",
+                Object::Array(
+                    [0i64, 0, width, height]
+                        .iter()
+                        .map(|v| Object::Integer(*v))
+                        .collect(),
+                ),
+            );
+            page.set("Contents", Object::Reference(content_id));
+            page.set("Resources", Object::Reference(resources_id));
+            let page_id = doc.add_object(Object::Dictionary(page));
+            kids.push(Object::Reference(page_id));
+            page_ids.push(page_id);
+        }
+
+        let page_count = kids.len() as u32;
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Count", Object::Integer(page_count as i64));
+        pages.set("Kids", Object::Array(kids));
+        let pages_id = doc.add_object(Object::Dictionary(pages));
+
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", Object::Reference(pages_id));
+        let catalog_id = doc.add_object(Object::Dictionary(catalog));
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        // Backfill /Parent links now that both node ids exist.
+        if let Some(Object::Dictionary(d)) = doc.objects.get_mut(&pages_id) {
+            d.set("Parent", Object::Reference(catalog_id));
+        }
+        for page_id in &page_ids {
+            if let Some(Object::Dictionary(d)) = doc.objects.get_mut(page_id) {
+                d.set("Parent", Object::Reference(pages_id));
+            }
+        }
+
+        let written = self.save_pdf(&mut doc, output)?;
+        Ok(OperationReport {
+            status: "success",
+            operation: "from-images",
+            output_file: display_path(&written),
+            pages: page_count,
+        })
+    }
+
+    // ---- small builders shared by watermark / page-numbers / from-images ----
+
+    fn font_object() -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.set("BaseFont", Object::Name(b"Helvetica".to_vec()));
+        dict.set("Subtype", Object::Name(b"Type1".to_vec()));
+        dict.set("FontType", Object::Integer(3));
+        dict
+    }
+
+    /// A page-content stream that draws `ops`, carrying its own Resources so
+    /// it renders even when the page inherits none.
+    fn overlay_stream(font_id: &ObjectId, ops: &str) -> Stream {
+        let mut res = Dictionary::new();
+        let mut fonts = Dictionary::new();
+        fonts.set("F1", Object::Reference(*font_id));
+        res.set("Font", Object::Dictionary(fonts));
+        let mut dict = Dictionary::new();
+        dict.set("Resources", Object::Dictionary(res));
+        Stream::new(dict, ops.as_bytes().to_vec())
+    }
+
+    fn xobject_resources(image_id: &ObjectId) -> Dictionary {
+        let mut xobjects = Dictionary::new();
+        xobjects.set("Im0", Object::Reference(*image_id));
+        let mut dict = Dictionary::new();
+        dict.set("XObject", Object::Dictionary(xobjects));
+        dict
+    }
+
+    /// Append a shared content stream to each page's `/Contents`, wrapping the
+    /// existing content in an Array so nothing is lost.
+    fn append_contents(doc: &mut Document, overlay_id: ObjectId) -> AppResult<()> {
+        let page_ids: Vec<ObjectId> = doc.get_pages().into_iter().map(|(_, id)| id).collect();
+        for page_id in &page_ids {
+            Self::append_content_to_page(doc, *page_id, overlay_id)?;
+        }
+        Ok(())
+    }
+
+    /// Append one content stream to a single page's `/Contents`.
+    fn append_content_to_page(doc: &mut Document, page_id: ObjectId, overlay_id: ObjectId) -> AppResult<()> {
+        let page = doc
+            .objects
+            .get_mut(&page_id)
+            .and_then(|o| match o {
+                Object::Dictionary(d) => Some(d),
+                _ => None,
+            })
+            .ok_or_else(|| AppError::Operation("page dictionary missing".into()))?;
+        let existing = page
+            .get(b"Contents")
+            .ok()
+            .cloned()
+            .map(|c| match c {
+                Object::Array(items) => items,
+                other => vec![other],
+            })
+            .unwrap_or_default();
+        let mut items = existing;
+        items.push(Object::Reference(overlay_id));
+        page.set("Contents", Object::Array(items));
+        Ok(())
     }
 
     /// Create a single-page sample document at `name` (workspace-relative).
@@ -858,6 +1415,17 @@ fn display_path(p: &Path) -> String {
     }
 }
 
+/// Zlib (RFC 1950) compression at level 0-9, used by `compress`.
+fn zlib_compress_level(bytes: &[u8], level: u32) -> AppResult<Vec<u8>> {
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+    std::io::Write::write_all(&mut encoder, bytes)
+        .map_err(|e| AppError::Operation(format!("zlib compress: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| AppError::Operation(format!("zlib finish: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,7 +1591,7 @@ mod tests {
     #[test]
     fn compress_produces_valid_doc() {
         let (engine, src) = three_page_doc();
-        let report = engine.compress(&src, Path::new("compressed.pdf")).unwrap();
+        let report = engine.compress(&src, Path::new("compressed.pdf"), 9).unwrap();
         assert_eq!(report.pages, 3);
         let loaded = Document::load(engine.root().join("compressed.pdf")).unwrap();
         assert_eq!(loaded.get_pages().len(), 3);
@@ -1041,5 +1609,111 @@ mod tests {
         assert_eq!(r.title.as_deref(), Some("Sample 1"));
         assert_eq!(r.creator.as_deref(), Some("LocalPDF-TUI"));
         assert!(r.file_size_bytes > 0);
+    }
+
+    /// How many `/Contents` array entries a page carries (1 = plain stream).
+    fn contents_refs(doc: &Document, page_id: ObjectId) -> usize {
+        let page = doc.get_dictionary(page_id).unwrap();
+        match page.get(b"Contents").unwrap() {
+            Object::Array(items) => items.len(),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn watermark_appends_overlay_to_every_page() {
+        let (engine, src) = three_page_doc();
+        let report = engine.watermark(&src, "CONFIDENTIAL", Path::new("wm.pdf")).unwrap();
+        assert_eq!(report.pages, 3);
+        let doc = Document::load(engine.root().join("wm.pdf")).unwrap();
+        for (_n, page_id) in doc.get_pages() {
+            assert_eq!(contents_refs(&doc, page_id), 2);
+        }
+        let err = engine.watermark(&src, "", Path::new("bad.pdf")).unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
+    }
+
+    #[test]
+    fn page_numbers_stamps_every_page() {
+        let (engine, src) = three_page_doc();
+        let report = engine.page_numbers(&src, Path::new("pn.pdf")).unwrap();
+        assert_eq!(report.pages, 3);
+        let doc = Document::load(engine.root().join("pn.pdf")).unwrap();
+        for (_n, page_id) in doc.get_pages() {
+            assert_eq!(contents_refs(&doc, page_id), 2);
+        }
+    }
+
+    #[test]
+    fn set_metadata_writes_info_dict() {
+        let (engine, src) = three_page_doc();
+        let pairs = vec![
+            ("Title".to_string(), "Q3 Report".to_string()),
+            ("Author".to_string(), "Yash".to_string()),
+        ];
+        engine.set_metadata(&src, &pairs, Path::new("meta.pdf")).unwrap();
+        let doc = Document::load(engine.root().join("meta.pdf")).unwrap();
+        let info_ref = doc.trailer.get(b"Info").unwrap();
+        let info_id = match info_ref {
+            Object::Reference(id) => *id,
+            _ => panic!("Info should be an indirect reference"),
+        };
+        let d = doc.get_dictionary(info_id).unwrap();
+        assert_eq!(d.get(b"Title").unwrap(), &Object::string_literal(b"Q3 Report"));
+        assert!(engine.set_metadata(&src, &[], Path::new("x.pdf")).is_err());
+    }
+
+    #[test]
+    fn extract_text_returns_page_text() {
+        let (engine, src) = three_page_doc();
+        let report = engine.extract_text(&src, None, None).unwrap();
+        assert_eq!(report.pages, 3);
+        let text = report.text.as_deref().unwrap();
+        assert!(text.contains("Sample 1"), "text was: {text:?}");
+        assert!(text.contains("Sample 3"), "text was: {text:?}");
+
+        // A page spec narrows the extraction and writes to a file.
+        let rep = engine
+            .extract_text(&src, Some("2"), Some(Path::new("page2.txt")))
+            .unwrap();
+        assert_eq!(rep.pages, 1);
+        assert!(rep.output_file.is_some());
+        let body = std::fs::read_to_string(engine.root().join("page2.txt")).unwrap();
+        assert!(body.contains("Sample 2"));
+    }
+
+    #[test]
+    fn from_images_then_extract_images_roundtrip() {
+        let (engine, _files) = three_samples();
+        let ws = engine.root();
+        let img_path = ws.join("tiny.png");
+        {
+            let img = image::DynamicImage::ImageRgb8(
+                image::RgbImage::from_pixel(2, 2, image::Rgb([9, 8, 7])).into(),
+            );
+            img.save(&img_path).unwrap();
+        }
+
+        let report = engine.from_images(&[&img_path], Path::new("tiny.pdf")).unwrap();
+        assert_eq!(report.pages, 1);
+
+        let tiny = ws.join("tiny.pdf");
+        let rep = engine.extract_images(&tiny, Path::new("tiny-images")).unwrap();
+        assert_eq!(rep.found, 1);
+        assert_eq!(rep.skipped, 0);
+        assert_eq!(rep.files.len(), 1);
+        let out_file = ws.join("tiny-images").join(&rep.files[0]);
+        assert!(out_file.exists());
+        let bytes = std::fs::read(&out_file).unwrap();
+        let loaded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(loaded.width(), 2);
+        assert_eq!(loaded.height(), 2);
+    }
+
+    #[test]
+    fn compress_rejects_bad_level() {
+        let (engine, src) = three_page_doc();
+        let err = engine.compress(&src, Path::new("c.pdf"), 10).unwrap_err();
+        assert!(matches!(err, AppError::Operation(_)));
     }
 }
