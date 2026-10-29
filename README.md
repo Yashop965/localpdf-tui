@@ -18,11 +18,11 @@ fast Rust binary, with two frontends over the same engine:
 | Reorder pages | ✓ | `--json --reorder in.pdf --order 3,1,2` |
 | Delete pages | ✓ | `--json --delete-pages in.pdf --pages 2,4-5` |
 | Document info | ✓ | `--json --info in.pdf` |
-| Text watermark (all pages) | agent | `--json --watermark in.pdf --text DRAFT` |
-| Page numbers | agent | `--json --pagenum in.pdf` |
-| Edit metadata | agent | `--json --set-metadata in.pdf --meta "Title=Q3"` |
-| Extract text | agent | `--json --extract-text in.pdf [--pages 1-2]` |
-| Extract images | agent | `--json --extract-images in.pdf [--out-dir dir]` |
+| Text watermark (all pages) | ✓ | `--json --watermark in.pdf --text DRAFT` |
+| Page numbers | ✓ | `--json --pagenum in.pdf` |
+| Edit metadata | ✓ | `--json --set-metadata in.pdf --meta "Title=Q3"` |
+| Extract text | ✓ | `--json --extract-text in.pdf [--pages 1-2]` |
+| Extract images | ✓ | `--json --extract-images in.pdf [--out-dir dir]` |
 | Assemble images → PDF | agent | `--json --from-images a.png b.jpg` |
 | Generate sample PDF | `[a]` key | `engine::generate_sample` (used by tests/demo) |
 

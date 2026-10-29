@@ -18,20 +18,39 @@ use crate::error::{AppError, AppResult};
 use crate::ui;
 
 /// Which operations the dashboard offers, in display order.
-pub const OPS: &[&str] = &["Merge", "Split", "Compress", "Rotate", "Delete", "Info"];
+pub const OPS: &[&str] = &[
+    "Merge",
+    "Split",
+    "Compress",
+    "Rotate",
+    "Delete",
+    "Info",
+    "Watermark",
+    "PageNum",
+    "Metadata",
+    "Extract Text",
+    "Extract Images",
+];
 pub const OPS_DESC: &[&str] = &[
     "concatenate the whole file queue into one document",
-    "extract page ranges from the highlighted queue file",
+    "extract page ranges from the highlighted file",
     "rebuild + flate-compress the highlighted file",
     "set /Rotate on pages — input `ranges:degrees`, e.g. 1,3:90",
     "remove page ranges from the highlighted file",
     "report pages, size, encryption and metadata",
+    "stamp a diagonal text watermark on every page",
+    "print the 1-based page number on each page",
+    "set one Info key — input `Key=Value`, e.g. Title=Q3",
+    "pull text out of pages — input ranges optional (blank = all)",
+    "pull embedded images into `<name>-images/`",
 ];
 
 /// Operations whose context input line is a page range spec.
-pub const HAS_RANGE_INPUT: &[usize] = &[1, 4]; // Split, Delete
+pub const HAS_RANGE_INPUT: &[usize] = &[1, 4, 9]; // Split, Delete, Extract Text
 /// The rotate op takes `ranges:degrees` in the input line.
 pub const ROTATE_INPUT: usize = 3;
+/// The watermark and metadata ops take free-text input lines.
+pub const TEXT_INPUT: &[usize] = &[6, 8]; // Watermark, Metadata
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
@@ -292,6 +311,128 @@ impl App {
                     Err(e) => self.set_log(StatusKind::Error, &format!("info failed: {e}")),
                 }
             }
+            "Watermark" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let text = self.ctx_input.trim();
+                if text.is_empty() {
+                    self.set_log(StatusKind::Error, "type the watermark text first, e.g. DRAFT");
+                    return;
+                }
+                match self.engine.watermark(&source, text, Path::new("watermarked.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("watermarked '{text}' → {} ({} pages)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("watermark failed: {e}")),
+                }
+            }
+            "PageNum" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                match self.engine.page_numbers(&source, Path::new("numbered.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("numbered → {} ({} pages)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("page-numbers failed: {e}")),
+                }
+            }
+            "Metadata" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let spec = self.ctx_input.trim();
+                let Some((key, value)) = spec
+                    .split_once('=')
+                    .and_then(|(k, v)| {
+                        let k = k.trim();
+                        (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
+                    })
+                else {
+                    self.set_log(StatusKind::Error, "type a Key=Value pair, e.g. Title=Q3");
+                    return;
+                };
+                let pairs = vec![(key.clone(), value.clone())];
+                match self.engine.set_metadata(&source, &pairs, Path::new("meta.pdf")) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!("set {key}='{value}' → {} ({} pages)", r.output_file, r.pages),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("metadata failed: {e}")),
+                }
+            }
+            "Extract Text" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let spec = self.ctx_input.trim();
+                let spec = if spec.is_empty() { None } else { Some(spec) };
+                match self.engine.extract_text(&source, spec, None) {
+                    Ok(r) => {
+                        let preview = r
+                            .text
+                            .as_deref()
+                            .and_then(|t| t.lines().find(|l| !l.trim().is_empty()))
+                            .unwrap_or("");
+                        self.set_log(
+                            StatusKind::Ok,
+                            &format!(
+                                "extracted {} chars from {} page{} · '{}'",
+                                r.characters,
+                                r.pages,
+                                if r.pages == 1 { "" } else { "s" },
+                                preview.chars().take(28).collect::<String>()
+                            ),
+                        );
+                    }
+                    Err(e) => self.set_log(StatusKind::Error, &format!("extract-text failed: {e}")),
+                }
+            }
+            "Extract Images" => {
+                let source = match self.active_source() {
+                    Some(s) => s.clone(),
+                    None => {
+                        self.set_log(StatusKind::Error, "no file selected — press [a] to queue one first");
+                        return;
+                    }
+                };
+                let out_dir = format!(
+                    "{}-images",
+                    source.file_stem().and_then(|s| s.to_str()).unwrap_or("out")
+                );
+                match self.engine.extract_images(&source, Path::new(&out_dir)) {
+                    Ok(r) => self.set_log(
+                        StatusKind::Ok,
+                        &format!(
+                            "pulled {} image{} → {} ({} unsupported)",
+                            r.found,
+                            if r.found == 1 { "" } else { "s" },
+                            out_dir,
+                            r.skipped
+                        ),
+                    ),
+                    Err(e) => self.set_log(StatusKind::Error, &format!("extract-images failed: {e}")),
+                }
+            }
             _ => unreachable!("OPS must match OPS_DESC"),
         }
     }
@@ -331,7 +472,9 @@ impl App {
 
     /// Whether the currently selected operation has a context input line.
     fn op_takes_input(&self) -> bool {
-        HAS_RANGE_INPUT.contains(&self.ops_index) || self.ops_index == ROTATE_INPUT
+        HAS_RANGE_INPUT.contains(&self.ops_index)
+            || self.ops_index == ROTATE_INPUT
+            || TEXT_INPUT.contains(&self.ops_index)
     }
 
     /// Whether `c` is a valid context-input character for the current op.
@@ -339,10 +482,12 @@ impl App {
         if !self.op_takes_input() || self.ctx_input.len() >= 24 {
             return false;
         }
-        if self.ops_index == ROTATE_INPUT {
-            c.is_ascii_digit() || c == ',' || c == '-' || (c == ':' && !self.ctx_input.contains(':'))
-        } else {
-            c.is_ascii_digit() || c == ',' || c == '-'
+        match self.ops_index {
+            ROTATE_INPUT => {
+                c.is_ascii_digit() || c == ',' || c == '-' || (c == ':' && !self.ctx_input.contains(':'))
+            }
+            6 | 8 => (c.is_ascii() && !c.is_ascii_control()) || c == ' ',
+            _ => c.is_ascii_digit() || c == ',' || c == '-',
         }
     }
 

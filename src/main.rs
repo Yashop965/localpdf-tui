@@ -7,10 +7,7 @@
 //!   operation against the sandboxed engine, and prints exactly one
 //!   deterministic JSON document to stdout. The exit code carries status.
 
-mod engine;
-mod error;
-mod tui;
-mod ui;
+use localpdf_tui::{engine, error, tui};
 
 use clap::Parser;
 use std::path::{Path, PathBuf};

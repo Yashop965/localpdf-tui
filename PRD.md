@@ -167,7 +167,8 @@ order (`3,1,2`), text. Invalid input never executes; it flashes in the log.
   TUI wiring (6-op dashboard, per-op context input) + 11 tests + CLI smoke.
 - **M2 — done (2026-10-30):** extract-text (bounded), extract-images
   (JPEG pass-through + Flate→PNG), images→PDF (`from_images`), watermark,
-  page numbers, metadata, compress `--level 0-9` + 17 tests + CLI smoke.
+  page numbers, metadata, compress `--level 0-9` + 20 tests (incl.
+  headless TUI key-driven integration tests) + CLI smoke. TUI grew to 11 ops.
 - **M3:** to-png rasterization (pdfium/magick interop), encryption, repair,
   watch/batch, config, release packaging.
 
